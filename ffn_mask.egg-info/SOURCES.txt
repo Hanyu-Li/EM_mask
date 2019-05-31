@@ -1,0 +1,9 @@
+setup.py
+ffn_mask/__init__.py
+ffn_mask/models.py
+ffn_mask/utils.py
+ffn_mask.egg-info/PKG-INFO
+ffn_mask.egg-info/SOURCES.txt
+ffn_mask.egg-info/dependency_links.txt
+ffn_mask.egg-info/requires.txt
+ffn_mask.egg-info/top_level.txt
