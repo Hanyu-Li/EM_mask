@@ -52,10 +52,12 @@ flags.DEFINE_string('model_name', None,
 flags.DEFINE_string('model_args', None,
                     'JSON string with arguments to be passed to the model '
                     'constructor.')
+flags.DEFINE_float('learning_rate', 0.001, '')
 flags.DEFINE_integer('batch_size', 1, '')
 flags.DEFINE_float('image_mean', 128, '')
 flags.DEFINE_float('image_stddev', 33, '')
 flags.DEFINE_integer('max_steps', 100000, '')
+flags.DEFINE_boolean('rotation', False, '')
 
 
 
@@ -74,23 +76,28 @@ def main(unused_argv):
     'model_class': model_class,
     'model_args': model_args,
     'batch_size': FLAGS.batch_size,
-    'num_classes': num_classes
+    'num_classes': num_classes,
+    'learning_rate': FLAGS.learning_rate
+
   }
+
+  logging.warn('training: %s', FLAGS.data_volumes)
+
 
   sess_config = tf.ConfigProto()
   sess_config.gpu_options.allow_growth = True
   sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
 
   model_dir = FLAGS.train_dir if hvd.rank() == 0 else None
-  save_summary_steps = 30 if hvd.rank() == 0 else None
-  save_checkpoints_secs = 90 if hvd.rank() == 0 else None
+  save_summary_steps = 90 if hvd.rank() == 0 else None
+  save_checkpoints_secs = 180 if hvd.rank() == 0 else None
 
   config=tf.estimator.RunConfig( 
     model_dir=model_dir,
     save_summary_steps=save_summary_steps,
     save_checkpoints_secs=save_checkpoints_secs,
     session_config=sess_config,
-    keep_checkpoint_max=300,
+    keep_checkpoint_max=100,
   )
   mask_estimator = tf.estimator.Estimator(
     model_fn=mask_utils.mask_model_fn_v2,
@@ -98,11 +105,12 @@ def main(unused_argv):
     params=params
     )
   bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
-  # logging_hook = tf.train.LoggingTensorHook(
-  #   {'flat_logits': 'flat_logits',
-  #    'flat_labels': 'flat_labels'},
-  #    every_n_iter=100,
-  # )
+  logging_hook = tf.train.LoggingTensorHook(
+    {'flat_logits': 'flat_logits',
+     'flat_labels': 'flat_labels'},
+    #  'flat_weights': 'flat_weights'},
+     every_n_iter=100,
+  )
   mask_estimator.train(
     # input_fn = lambda: mask_utils.train_input_fn(
     #   FLAGS.data_volumes, 
@@ -122,9 +130,10 @@ def main(unused_argv):
       label_size,
       FLAGS.batch_size, 
       FLAGS.image_mean, 
-      FLAGS.image_stddev),
+      FLAGS.image_stddev,
+      FLAGS.rotation),
     steps=FLAGS.max_steps,
-    hooks=[bcast_hook])
+    hooks=[bcast_hook, logging_hook])
 
 if __name__ == '__main__':
   app.run(main)

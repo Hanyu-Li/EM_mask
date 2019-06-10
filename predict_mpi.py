@@ -1,4 +1,4 @@
-'''Script for training a mask classification model.'''
+'''Script for predicting with a mask classification model.'''
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -17,7 +17,7 @@ from ffn.training import inputs
 from ffn.training.import_util import import_symbol
 from ffn_mask import utils as mask_utils
 
-import horovod.tensorflow as hvd
+# import horovod.tensorflow as hvd
 import sys
 from mpi4py import MPI
 import json
@@ -71,9 +71,6 @@ def main(unused_argv):
   sess_config.gpu_options.allow_growth = True
   sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
 
-  # model_dir = FLAGS.train_dir if hvd.rank() == 0 else None
-  # save_summary_steps = 30 if hvd.rank() == 0 else None
-  # save_checkpoints_secs = 30 if hvd.rank() == 0 else None
 
   model_checkpoint = FLAGS.model_checkpoint if hvd.rank() == 0 else None
 
@@ -110,8 +107,8 @@ def main(unused_argv):
   predictions = mask_estimator.predict(
     input_fn=lambda: mask_utils.predict_input_fn(
       data_volumes=FLAGS.data_volumes, 
-      chunk_shape=fov_size[::-1], 
-      overlap=overlap[::-1],
+      chunk_shape=fov_size, 
+      overlap=overlap,
       batch_size=FLAGS.batch_size, 
       offset=FLAGS.image_mean, 
       scale=FLAGS.image_stddev,
@@ -127,8 +124,8 @@ def main(unused_argv):
     output_volumes=FLAGS.output_volumes,
     output_shapes=output_shapes,
     num_classes=num_classes,
-    chunk_shape=fov_size[::-1],
-    overlap=overlap[::-1],
+    chunk_shape=fov_size,
+    overlap=overlap,
     mpi=FLAGS.mpi)
 
   # f_w = h5py.File('')

@@ -53,7 +53,7 @@ def _load_from_numpylike_v2(coord, volume, start_offset, chunk_shape, axes='zyx'
 
 def _load_from_numpylike_with_pad(coord, volume, pad_start, pad_end, chunk_shape,
                                   sample_start=None, sample_size=None):
-  '''When out of pad '''
+  '''load from numpy like with padding, all in zyx order.'''
   real_volume_shape = volume.shape
   pad_bbox = bounding_box.BoundingBox(start=(0,0,0), size=pad_start+real_volume_shape+pad_end)
   # print(sample_start, sample_size)
@@ -114,7 +114,7 @@ def parser(proto):
   return coord, volname
 
 def h5_sequential_chunk_generator(data_volumes, 
-                                  chunk_shape=(32, 64, 64),
+                                  chunk_shape=(32,64, 64), # xyz
                                   overlap=(0, 0, 0),
                                   bounding_box=None,
                                   var_threshold=10):
@@ -166,34 +166,61 @@ def h5_sequential_chunk_generator(data_volumes,
             logging.info('skipped chunk %s', str(center))
   return gen
 def h5_sequential_chunk_generator_v2(data_volumes,
-                                     chunk_shape=(32, 64, 64),
+                                     chunk_shape=(64, 64, 32),
                                      overlap=(0, 0, 0),
-                                     bbox=None,
-                                     var_threshold=10):
-  if not bbox:
-    pass
-  elif bbox:
-    sample_bbox = bounding_box_pb2.BoundingBox()
-    text_format.Parse(bbox, sample_bbox)
-
+                                     bounding_box=None,
+                                     var_threshold=10, 
+                                     data_axes='zyx'):
+  '''Sequentially generate chunks(with overlap) from volumes'''
   image_volume_map = {}
   for vol in data_volumes.split(','):
     volname, path, dataset = vol.split(':')
     image_volume_map[volname] = h5py.File(path,'r')[dataset]
-    max_size = image_volume.map[volname].shape
-    max_bbox = bounding_box.BoundingBox([0,0,0], max_size)
-    logging.warn('max_bbox %s', max_bbox)
 
+  chunk_shape = np.array(chunk_shape)
+  chunk_offset = chunk_shape // 2
+  overlap = np.array(overlap)
+  if data_axes == 'zyx':
+    chunk_shape = chunk_shape[::-1]
+    overlap = overlap[::-1]
+  
+  if bounding_box:
+    sample_bbox = bounding_box_pb2.BoundingBox()
+    text_format.Parse(bounding_box, sample_bbox)
+    sample_start = geom_utils.ToNumpy3Vector(sample_bbox.start)
+    sample_size = geom_utils.ToNumpy3Vector(sample_bbox.size)
+    print(sample_start, sample_size)
+  else:
+    sample_start = None
+    sample_size = None
+  
+  def gen():
+    for key, val in image_volume_map.items():
+      data_shape = np.array(val.shape)
+      step_shape = chunk_shape - overlap
+      step_counts = (data_shape - 1) // step_shape + 1
+      pad_start = overlap // 2
+      # pad zeros at end to ensure modular zero
+      pad_end = step_counts * step_shape + pad_start - data_shape
+      # print('step:', step_shape, step_counts)
+      # pad_data = np.pad(val, zip(begin_pad, end_pad), 'reflect')
+      # print(pad_data.shape)
+      grid_zyx = [np.arange(j)*i+d//2 for i,j,d in zip(step_shape, step_counts, chunk_shape)]
+      # print('grid:', grid_zyx)
+      grid = np.array(np.meshgrid(*grid_zyx)).T.reshape(-1, 3)
+      
+      for i in range(grid.shape[0]):
+        center = grid[i]
+        image = _load_from_numpylike_with_pad(center, val, pad_start, pad_end, 
+          chunk_shape, sample_start, sample_size )
+        logging.warn('loaded_shape %s', image.shape)
 
-    calc = bounding_box.OrderlyOverlappingCalculator(
-      outer_box=bbox, 
-      sub_box_size=subvolume_size, 
-      overlap=overlap, 
-      include_small_sub_boxes=True,
-      back_shift_small_sub_boxes=False)
-    
-  print([bb for bb in calc.generate_sub_boxes()])
-
+        if image is not None:
+          if np.var(image[...]) > var_threshold:
+            yield (center, image)
+          else:
+            logging.info('skipped chunk %s', str(center))
+  return gen
 
 def get_h5_shapes(data_volumes):
   image_volume_shape_map = {}
@@ -230,11 +257,73 @@ def h5_sequential_chunk_writer(prediction_generator,
     output_shape = output_shapes[volname]
     logging.warn('output_shape %s', output_shape)
     output_volume_map[volname] = f.create_dataset(name=dataset, shape=output_shape, dtype='float32')
+    logits_ds = f.create_dataset(name='logits', shape=list(output_shape)+[num_classes], dtype='float32') 
     # output_volume = np.zeros(shape=output_shapes[volname], dtype=np.float32)
     max_bbox = bounding_box.BoundingBox(start=(0,0,0), size=output_shapes[volname])
     for p in prediction_generator:
-      center, pred = p['center'], p['class_prediction']
+      center, logits, pred = p['center'], p['logits'], p['class_prediction']
       logging.warn('pred shape %s', pred.shape)
+      pad_w_start = center - chunk_shape // 2 + overlap // 2
+      pad_w_end = center + (chunk_shape+1) // 2 - overlap // 2
+      coord_offset = overlap // 2
+      w_start = pad_w_start - coord_offset
+      w_end = pad_w_end - coord_offset
+      logging.warn('diagnose_1 %s %s %s', center, pad_w_start, coord_offset)
+      logging.warn('diagnose_2 %s %s', w_start, w_end)
+      
+      write_bbox = bounding_box.BoundingBox(start=w_start, end=w_end)
+      logging.warn('write_bbox %s, %s', center, write_bbox.size)
+      
+      write_bbox = bounding_box.intersection(write_bbox, max_bbox)
+      read_bbox = bounding_box.BoundingBox(start=coord_offset, size=write_bbox.size)
+      
+      write_slices = write_bbox.to_slice()
+      read_slices = read_bbox.to_slice()
+      write_slices = tuple([write_slices[i] for i in [2,1,0]])
+      read_slices = tuple([read_slices[i] for i in [2,1,0]])
+      logging.warn('pred shape %s', pred[read_slices].shape)
+      output_volume_map[volname][write_slices] = pred[read_slices]
+      logits_ds[write_slices] = logits[read_slices]
+#       output_volume[write_slices] = pred[read_slices+(0,)]
+    f.close()
+
+def h5_sequential_chunk_writer_v2(prediction_generator,
+                               output_volumes, 
+                               output_shapes,
+                               num_classes,
+                               chunk_shape=(32, 64, 64),
+                               overlap=(0, 0, 0),
+                               axes='zyx',
+                               mpi=False):
+  '''Sequentially write chunks(with overlap) from volumes'''
+  chunk_shape = np.array(chunk_shape)
+  chunk_offset = chunk_shape // 2
+  overlap = np.array(overlap)
+  if axes == 'zyx':
+    chunk_shape = chunk_shape[::-1]
+    chunk_offset = chunk_offset[::-1]
+    overlap = chunk_shape[::-1]
+
+  step_shape = chunk_shape - overlap
+  output_volume_map = {}
+  
+  for vol in output_volumes.split(','):
+    volname, path, dataset = vol.split(':')
+    if not mpi:
+      f = h5py.File(path, 'w')
+    else:
+      f = h5py.File(path, 'w', driver='mpio', comm=MPI.COMM_WORLD)
+
+
+    output_shape = output_shapes[volname]
+    logging.warn('output_shape %s', output_shape)
+    output_volume_map[volname] = f.create_dataset(name=dataset, shape=output_shape, dtype='float32')
+    # output_volume = np.zeros(shape=output_shapes[volname], dtype=np.float32)
+    max_bbox = bounding_box.BoundingBox(start=(0,0,0), size=output_shapes[volname][::-1])
+    logging.warn('bbox %s', max_bbox)
+    for p in prediction_generator:
+      center, pred = p['center'], p['class_prediction']
+      logging.warn('pred shape %s %s', center, pred.shape)
       pad_w_start = center - chunk_shape // 2 + overlap // 2
       pad_w_end = center + (chunk_shape+1) // 2 - overlap // 2
       coord_offset = overlap // 2
@@ -332,6 +421,7 @@ def load_from_numpylike(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
     return data
   dtype = volume.dtype
   num_classes = volume.shape[-1]
+  logging.warn('weird class: %d %s', num_classes, volume.shape)
   with tf.name_scope('load_from_h5') as scope:
     loaded = tf.py_func(
         _load_from_numpylike, [coord_tensor], [dtype],
@@ -352,6 +442,54 @@ def filter_out_of_bounds(coord, chunk_shape, max_shape):
   else:
     logging.error('crap')
     return False
+def preprocess_edt_labels(labels):
+  labels = tf.cast(labels, tf.float32)
+  labels = labels * 10
+  return labels
+
+def get_full_size(chunk_size, label_size):
+  new_chunk_size = [
+    int(np.ceil(chunk_size[0] * np.sqrt(2))),
+    int(np.ceil(chunk_size[1] * np.sqrt(2))),
+    chunk_size[2]]
+  new_label_size = [
+    int(np.ceil(label_size[0] * np.sqrt(2))), 
+    int(np.ceil(label_size[1] * np.sqrt(2))),
+    label_size[2]]
+  return new_chunk_size, new_label_size
+
+  
+def random_rotate(coord, image, labels, chunk_shape, label_shape):
+  angle = np.random.rand() * 2 * np.pi
+  # image_rot = tf.contrib.image.rotate(image, angle)
+  # labels_rot = tf.contrib.image.rotate(labels, angle)
+  # logging.warning('rotated_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
+  # image_crop = crop_v2(image_rot, crop_shape=chunk_shape)
+  # labels_crop = crop_v2(labels_rot, crop_shape=label_shape)
+  # logging.warning('cropped_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
+  with tf.device('/cpu:0'):
+    image = tf.contrib.image.rotate(image, angle)
+    labels = tf.contrib.image.rotate(labels, angle)
+    # logging.warning('rotated_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
+    image= crop_v3(image, crop_shape=chunk_shape)
+    labels= crop_v3(labels, crop_shape=label_shape)
+  # logging.warning('cropped_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
+    return coord, image, labels
+
+def random_rotate_v2(coord, image, labels, chunk_shape, label_shape):
+  angle = np.random.rand() * 2 * np.pi
+  with tf.device('/cpu:0'):
+    image = tf.contrib.image.rotate(image, angle, name='rot_im')
+    labels = tf.contrib.image.rotate(labels, angle, name='rot_lb')
+    # logging.warning('rotated_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
+    image_offset = np.array(image.shape.as_list())[1:3] // 2 - np.array(chunk_shape)[0:2] // 2
+    label_offset = np.array(labels.shape.as_list())[1:3] // 2 - np.array(label_shape)[0:2] // 2
+    # off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
+    logging.warning('offsets: %s %s', image_offset, label_offset)
+    image= tf.image.crop_to_bounding_box(image, image_offset[0], image_offset[1], chunk_shape[0], chunk_shape[1])
+    labels= tf.image.crop_to_bounding_box(labels, label_offset[0], label_offset[1], label_shape[0], label_shape[1])
+    logging.warning('post offset shapes: %s %s', image.shape, labels.shape)
+    return coord, image, labels
 
 def train_input_fn_v2(data_volumes, 
                       label_volumes, 
@@ -361,7 +499,8 @@ def train_input_fn_v2(data_volumes,
                       label_shape, 
                       batch_size, 
                       offset, 
-                      scale):
+                      scale,
+                      rotation=False):
   # def h5_coord_chunk_dataset(data_volumes, label_volumes, tf_coords, num_classes, chunk_shape, label_shape):
   def h5_coord_chunk_dataset():
     image_volume_map = {}
@@ -372,10 +511,21 @@ def train_input_fn_v2(data_volumes,
     label_volume_map = {}
     for vol in label_volumes.split(','):
       volname, path, dataset = vol.split(':')
-      label_volume_map[volname] = tf.keras.utils.to_categorical(
-        h5py.File(path, 'r')[dataset])
+      if num_classes > 1:
+        label_volume_map[volname] = tf.keras.utils.to_categorical(
+          h5py.File(path, 'r')[dataset])
+      else:
+        label_volume_map[volname] = np.expand_dims(h5py.File(path, 'r')[dataset], axis=-1)
+        
 
     for key in image_volume_map: # assume only one key in the map for now
+      if rotation:
+        pre_chunk_shape, pre_label_shape = get_full_size(chunk_shape, label_shape)
+      else:
+        pre_chunk_shape = chunk_shape
+        pre_label_shape = label_shape
+      logging.warning('pre shapes: %s %s', pre_chunk_shape, pre_label_shape)
+
       max_shape = image_volume_map[key].shape
       # fnames = tf.matching_files(tf_coords+'*')
       # logging.info('fnames %s', fnames)
@@ -389,7 +539,7 @@ def train_input_fn_v2(data_volumes,
       ds = files.apply(
         tf.data.experimental.parallel_interleave(
           lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
-          cycle_length=2
+          cycle_length=1
         )
       )
       # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'), cycle_length=2)
@@ -398,14 +548,19 @@ def train_input_fn_v2(data_volumes,
       # ds = ds.filter(lambda coord, volname: filter_out_of_bounds(coord, chunk_shape, max_shape))
       ds = ds.map(lambda coord, volname: (
           coord, 
-          load_from_numpylike(coord, image_volume_map[key], chunk_shape), 
-          load_from_numpylike(coord, label_volume_map[key], label_shape)), 
+          load_from_numpylike(coord, image_volume_map[key], pre_chunk_shape), 
+          load_from_numpylike(coord, label_volume_map[key], pre_label_shape)), 
         num_parallel_calls=tf.data.experimental.AUTOTUNE)
       ds = ds.map(lambda coord, image, label: (
           coord, 
           preprocess_image(image, offset, scale),
+          # preprocess_edt_labels(label)),
           tf.cast(label, tf.float32)), 
         num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      if rotation:
+        ds = ds.map(lambda coord, image, label: random_rotate_v2(
+          coord, image, label, chunk_shape, label_shape), 
+          num_parallel_calls=tf.data.experimental.AUTOTUNE)         
       ds = ds.map(lambda coord, image, label: (
         {
         'center': coord[0],
@@ -414,7 +569,7 @@ def train_input_fn_v2(data_volumes,
         label),
         num_parallel_calls=tf.data.experimental.AUTOTUNE)
       ds = ds.batch(batch_size, drop_remainder=True)
-      ds = ds.prefetch(16)
+      ds = ds.prefetch(1)
       logging.warn('ds_shape: %d, %s', batch_size, ds)
 
       return ds
@@ -442,6 +597,22 @@ def predict_input_fn(data_volumes, chunk_shape,
   }
   return features
 
+# def predict_input_fn_v2(data_volumes,
+#                         chunk_shape,
+#                         overlap,
+#                         batch_size,
+#                         offset,
+#                         scale,
+#                         bounding_box, 
+#                         var_threshold):
+#   bbox = bounding_box_pb2.BoundingBox()
+#   text_format.Parse(bounding_box, bbox)
+#   def h5_sequential_chunk_dataset():
+#     pass
+
+
+
+
 def ortho_cut(volume, batch_size):
   '''Concat orthogonal cuts'''
   _,z,y,x,c = volume.get_shape().as_list()
@@ -462,20 +633,20 @@ def ortho_cut(volume, batch_size):
 
 def ortho_project(volume, batch_size):
   '''Concat orthogonal cuts'''
-  _,z,y,x,c = volume.get_shape().as_list()
-  b = batch_size
+  b,z,y,x,c = volume.get_shape().as_list()
+  # b = batch_size
   # convert first dim to 0
-  zero_first = tf.zeros([b, z, y, x, 1], dtype=tf.float32)
-  new_volume = tf.concat([zero_first, volume[...,1:]], axis=-1)
-  logging.warn('old_volume_shape: %s', volume.shape)
-  logging.warn('new_volume_shape: %s', new_volume.shape)
+  # zero_first = tf.zeros([b, z, y, x, 1], dtype=tf.float32)
+  # new_volume = tf.concat([zero_first, volume[...,1:]], axis=-1)
+  # logging.warn('old_volume_shape: %s', volume.shape)
+  # logging.warn('new_volume_shape: %s', new_volume.shape)
   #print(b,z,y,x,c)
-  # yx = volume[0:b,z//2,:,:,:]
-  # zx = volume[0:b,:,y//2,:,:]
-  # zy = volume[0:b,:,:,x//2,:]
-  yx = tf.reduce_mean(new_volume, axis=1)
-  zx = tf.reduce_mean(new_volume, axis=2)
-  zy = tf.reduce_mean(new_volume, axis=3)
+  yx = volume[0:b,z//2,:,:,:]
+  zx = volume[0:b,:,y//2,:,:]
+  zy = volume[0:b,:,:,x//2,:]
+  # yx = tf.reduce_mean(new_volume, axis=1)
+  # zx = tf.reduce_mean(new_volume, axis=2)
+  # zy = tf.reduce_mean(new_volume, axis=3)
   yz = tf.transpose(zy, perm=[0, 2, 1, 3])
   zz_pad = tf.zeros([b, z, z, c], dtype=tf.float32)
   output = tf.concat(
@@ -483,6 +654,43 @@ def ortho_project(volume, batch_size):
      tf.concat([zx, zz_pad], axis=2)],
     axis=1)
   return output
+def ortho_project_rgb(volume, batch_size):
+  b,z,y,x,c = volume.get_shape().as_list()
+  #b = batch_size
+  # convert first dim to 0, which is default background
+  zero_first = tf.zeros([b, z, y, x, 1], dtype=tf.float32)
+  new_volume = tf.concat([zero_first, volume[...,1:]], axis=-1)
+
+  color_palette = tf.constant([
+    [1,0,0],
+    [0,1,0],
+    [0,0,1],
+    [1,1,0],
+    [0,1,1],
+    [1,0,1]], tf.float32)
+  
+  rgb_volume = tf.reshape(
+    tf.matmul(
+      tf.reshape(new_volume, [-1, c]), color_palette[:c]),
+    [b,z,y,x,3]
+  )
+
+
+
+
+  yx = tf.reduce_mean(rgb_volume, axis=1)
+  zx = tf.reduce_mean(rgb_volume, axis=2)
+  zy = tf.reduce_mean(rgb_volume, axis=3)
+  yz = tf.transpose(zy, perm=[0, 2, 1, 3])
+  zz_pad = tf.zeros([b, z, z, 3], dtype=tf.float32)
+  output = tf.concat(
+    [tf.concat([yx, yz], axis=2),
+     tf.concat([zx, zz_pad], axis=2)],
+    axis=1)
+  return output
+
+
+
 
 def mask_model_fn(features, labels, mode, params):
 
@@ -494,7 +702,7 @@ def mask_model_fn(features, labels, mode, params):
   class_prediction = tf.argmax(outputs, axis=-1)
   predictions = {
     'center': features['center'],
-    'mask': outputs,
+    'logits': outputs,
     'class_prediction': class_prediction 
   }
   logging.warn('features in mask model %s, %s', features['center'], features['image'])
@@ -553,7 +761,7 @@ def mask_model_fn(features, labels, mode, params):
     tf.summary.scalar('accuracy', accuracy[1])
     return tf.estimator.EstimatorSpec(
       mode, loss=loss, eval_metric_ops=metrics)
-def crop_v2(tensor, offset, crop_shape, batched=False):
+def crop_v2(tensor, crop_shape, offset=(0, 0, 0), batched=False):
   """Extracts 'crop_shape' around 'offset' from 'tensor'.
 
   Args:
@@ -595,10 +803,55 @@ def crop_v2(tensor, offset, crop_shape, batched=False):
       cropped = tf.squeeze(cropped, axis=0)
 
     return cropped
+
+def crop_v3(tensor, crop_shape, offset=(0, 0, 0), batched=False):
+  """Extracts 'crop_shape' around 'offset' from 'tensor'.
+
+  Args:
+    tensor: tensor to extract data from (b, [z], y, x, c)
+    offset: (x, y, [z]) offset from the center point of 'tensor'; center is
+        taken to be 'shape // 2'
+    crop_shape: (x, y, [z]) shape to extract
+    batched: if True, first dim is b
+
+  Returns:
+    cropped tensor
+  """
+  with tf.name_scope('offset_crop'):
+    shape = np.array(tensor.shape.as_list())
+
+    # Nothing to do?
+    #if (shape[1:-1] == crop_shape[::-1]).all():
+    if shape[1:-1] == crop_shape[::-1]:
+      return tensor
+
+    off_y = shape[-3] // 2 - crop_shape[1] // 2 + offset[1]
+    off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
+
+    if not batched:
+      tensor = tf.expand_dims(tensor, axis=0)
+    if len(offset) == 2:
+      tensor = tensor[:,
+                       off_y:(off_y + crop_shape[1]),
+                       off_x:(off_x + crop_shape[0]),
+                       :]
+    else:
+      off_z = shape[-4] // 2 - crop_shape[2] // 2 + offset[2]
+      tensor = tensor[:,
+                       off_z:(off_z + crop_shape[2]),
+                       off_y:(off_y + crop_shape[1]),
+                       off_x:(off_x + crop_shape[0]),
+                       :]
+    if not batched:
+      tensor = tf.squeeze(tensor, axis=0)
+
+    return tensor
+
 def mask_model_fn_v2(features, labels, mode, params):
   model_class = params['model_class']
   model_args = params['model_args']
   batch_size = params['batch_size']
+  learning_rate = params['learning_rate']
 
   fov_size = model_args['fov_size']
   label_size = model_args['label_size']
@@ -629,10 +882,116 @@ def mask_model_fn_v2(features, labels, mode, params):
   # logging.warn('loss %s %s', labels.shape, outputs.shape)
   flat_logits = tf.reshape(outputs, (-1, params['num_classes']), name='flat_logits')
   flat_labels = tf.reshape(labels, (-1, params['num_classes']), name='flat_labels')
+
+  # first weight is zero, the later will evenly split 1.0
+  # weights_template = tf.constant([0.9 / (params['num_classes']-1) if i != 0 else 0.1 for i in range(params['num_classes'])])
+  # logging.warning('weights %s', weights_template)
+  # flat_weights = tf.gather(weights_template, tf.argmax(flat_labels, axis=-1), name='flat_weights')
+  
   loss = tf.losses.softmax_cross_entropy(
     onehot_labels=flat_labels,
     logits=flat_logits,
+    # weights=flat_weights,
     label_smoothing=0.05
+  )
+  # loss = tf.losses.sigmoid_cross_entropy(
+  #   multi_class_labels=flat_labels,
+  #   logits=flat_logits,
+  #   label_smoothing=0.05)
+  if mode == tf.estimator.ModeKeys.TRAIN:
+    # optimizer = tf.train.AdagradOptimizer(learning_rate=learning_rate * hvd.size())
+    # optimizer = tf.train.MomentumOptimizer(
+    #         learning_rate=learning_rate * hvd.size(), momentum=0.9)
+          
+    optimizer = tf.train.AdamOptimizer(
+            learning_rate=learning_rate * hvd.size(),
+            beta1=0.9,
+            beta2=0.999,
+            epsilon=1e-08)
+    # optimizer = tf.keras.optimizers.SGD(
+    #   lr=learning_rate * hvd.size(),
+    # )
+    # optimizer =tf.train.RMSPropOptimizer(
+    #   learning_rate=learning_rate * hvd.size(),
+    #   decay=0.9,
+    #   momentum=0.0,
+    #   epsilon=1e-10,
+    # )
+    optimizer = hvd.DistributedOptimizer(optimizer, name='distributed_optimizer')
+
+
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    with tf.control_dependencies(update_ops):
+      train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+    tf.summary.image('image', ortho_cut(features['image'], batch_size), 
+      max_outputs=batch_size)
+    tf.summary.image('labels', ortho_project_rgb(labels, batch_size), 
+      max_outputs=batch_size)
+    tf.summary.image('output', ortho_project_rgb(outputs, batch_size), 
+      max_outputs=batch_size)
+    return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+    
+  
+  elif mode == tf.estimator.ModeKeys.EVAL:
+    accuracy = tf.metrics.accuracy(labels=labels,
+                                   predictions=predictions['mask'],
+                                   name='acc_op')
+    metrics = {
+      'accuracy': accuracy
+    }
+    tf.summary.scalar('accuracy', accuracy[1])
+    return tf.estimator.EstimatorSpec(
+      mode, loss=loss, eval_metric_ops=metrics)
+
+def mask_model_fn_edt(features, labels, mode, params):
+  '''Euclidean distance models.
+  
+  The logits won't be classification but regression, num class should be 1
+  
+  
+  '''
+  model_class = params['model_class']
+  model_args = params['model_args']
+  batch_size = params['batch_size']
+  learning_rate = params['learning_rate']
+
+  fov_size = model_args['fov_size']
+  label_size = model_args['label_size']
+
+  logging.warn('>> shapes: %s %s', fov_size, label_size)
+
+
+  # crop_labels = crop_v2(labels, np.zeros((3,), np.int32), np.array(label_size)[::-1])
+  outputs = model_class(features['image'], params['num_classes'])
+  # logits = tf.nn.softmax(outputs)
+  # class_prediction = tf.argmax(outputs, axis=-1)
+  predictions = {
+    'center': features['center'],
+    'mask': outputs,
+    # 'class_prediction': class_prediction 
+  }
+  if mode == tf.estimator.ModeKeys.PREDICT:
+    center_op = tf.identity(features['center'], name='center')
+    return tf.estimator.EstimatorSpec(mode, predictions=predictions)
+  
+  # loss = tf.losses.sigmoid_cross_entropy(
+  #   labels,
+  #   outputs,
+  #   weights=1.0,
+  #   label_smoothing=0,
+  # )
+  # one_hot_class_prediction = tf.one_hot(class_prediction, params['num_classes'])
+  logging.warn('loss %s %s', labels.shape, outputs.shape)
+  flat_logits = tf.reshape(outputs, (-1, params['num_classes']), name='flat_logits')
+  flat_labels = tf.reshape(labels, (-1, params['num_classes']), name='flat_labels')
+  # loss = tf.losses.softmax_cross_entropy(
+  #   onehot_labels=flat_labels,
+  #   logits=flat_logits,
+  #   label_smoothing=0.05
+  # )
+  loss = tf.losses.mean_squared_error(
+    flat_labels,
+    flat_logits,
   )
   if mode == tf.estimator.ModeKeys.TRAIN:
     # optimizer = tf.train.AdagradOptimizer(learning_rate=0.1*hvd.size())
@@ -640,7 +999,7 @@ def mask_model_fn_v2(features, labels, mode, params):
     #         learning_rate=0.001 * hvd.size(), momentum=0.9)
           
     optimizer = tf.train.AdamOptimizer(
-            learning_rate=0.001 * hvd.size(),
+            learning_rate=learning_rate * hvd.size(),
             beta1=0.9,
             beta2=0.999,
             epsilon=1e-08)
