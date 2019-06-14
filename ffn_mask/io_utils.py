@@ -17,33 +17,13 @@ from ffn.training.mask import crop
 import horovod.tensorflow as hvd
 import mpi4py
 from mpi4py import MPI
-
+import cloudvolume
 comm = MPI.COMM_WORLD
 rank = comm.rank
 
 def labels_to_membrane(labels):
   return np.logical_or(np.asarray(labels)==0, 
                        find_boundaries(labels, mode='thick'))
-# def _load_from_numpylike(coord, volume, start_offset, chunk_shape, axes='zyx'):
-#     """Load from coord and volname, handling 3d or 4d volumes."""
-#     # Get data, including all channels if volume is 4d.
-#     starts = np.array(coord) - start_offset
-#     slc = bounding_box.BoundingBox(start=starts, size=chunk_shape).to_slice()
-#     if volume.ndim == 4:
-#       slc = np.index_exp[:] + slc
-#     # rearrange to z,y,x order
-#     if axes == 'xyz':
-#       data = volume[slc[2], slc[1], slc[0]]
-#     elif axes == 'zyx':
-#       data = volume[slc[0], slc[1], slc[2]]
-
-#     # If 4d, move channels to back.  Otherwise, just add flat channels dim.
-#     if data.ndim == 4:
-#       data = np.rollaxis(data, 0, start=4)
-#     else:
-#       data = np.expand_dims(data, 4)
-
-#     return data
 def _load_from_numpylike_v2(coord, volume, start_offset, chunk_shape, axes='zyx'):
   starts = np.array(coord) - start_offset
   slc = bounding_box.BoundingBox(start=starts, size=chunk_shape).to_slice()
@@ -157,7 +137,7 @@ def h5_sequential_chunk_generator(data_volumes,
         center = grid[i]
         image = _load_from_numpylike_with_pad(center, val, pad_start, pad_end, 
           chunk_shape, sample_start, sample_size )
-        logging.warn('loaded_shape %s', image.shape)
+        #logging.warn('loaded_shape %s', image.shape)
 
         if image is not None:
           if np.var(image[...]) > var_threshold:
@@ -213,7 +193,7 @@ def h5_sequential_chunk_generator_v2(data_volumes,
         center = grid[i]
         image = _load_from_numpylike_with_pad(center, val, pad_start, pad_end, 
           chunk_shape, sample_start, sample_size )
-        logging.warn('loaded_shape %s', image.shape)
+        # logging.warn('loaded_shape %s', image.shape)
 
         if image is not None:
           if np.var(image[...]) > var_threshold:
@@ -255,24 +235,24 @@ def h5_sequential_chunk_writer(prediction_generator,
 
 
     output_shape = output_shapes[volname]
-    logging.warn('output_shape %s', output_shape)
+    # logging.warn('output_shape %s', output_shape)
     output_volume_map[volname] = f.create_dataset(name=dataset, shape=output_shape, dtype='float32')
     logits_ds = f.create_dataset(name='logits', shape=list(output_shape)+[num_classes], dtype='float32') 
     # output_volume = np.zeros(shape=output_shapes[volname], dtype=np.float32)
     max_bbox = bounding_box.BoundingBox(start=(0,0,0), size=output_shapes[volname])
     for p in prediction_generator:
       center, logits, pred = p['center'], p['logits'], p['class_prediction']
-      logging.warn('pred shape %s', pred.shape)
+      # logging.warn('pred shape %s', pred.shape)
       pad_w_start = center - chunk_shape // 2 + overlap // 2
       pad_w_end = center + (chunk_shape+1) // 2 - overlap // 2
       coord_offset = overlap // 2
       w_start = pad_w_start - coord_offset
       w_end = pad_w_end - coord_offset
-      logging.warn('diagnose_1 %s %s %s', center, pad_w_start, coord_offset)
-      logging.warn('diagnose_2 %s %s', w_start, w_end)
+      # logging.warn('diagnose_1 %s %s %s', center, pad_w_start, coord_offset)
+      # logging.warn('diagnose_2 %s %s', w_start, w_end)
       
       write_bbox = bounding_box.BoundingBox(start=w_start, end=w_end)
-      logging.warn('write_bbox %s, %s', center, write_bbox.size)
+      # logging.warn('write_bbox %s, %s', center, write_bbox.size)
       
       write_bbox = bounding_box.intersection(write_bbox, max_bbox)
       read_bbox = bounding_box.BoundingBox(start=coord_offset, size=write_bbox.size)
@@ -281,7 +261,7 @@ def h5_sequential_chunk_writer(prediction_generator,
       read_slices = read_bbox.to_slice()
       write_slices = tuple([write_slices[i] for i in [2,1,0]])
       read_slices = tuple([read_slices[i] for i in [2,1,0]])
-      logging.warn('pred shape %s', pred[read_slices].shape)
+      # logging.warn('pred shape %s', pred[read_slices].shape)
       output_volume_map[volname][write_slices] = pred[read_slices]
       logits_ds[write_slices] = logits[read_slices]
 #       output_volume[write_slices] = pred[read_slices+(0,)]
@@ -292,19 +272,22 @@ def h5_sequential_chunk_writer_v2(prediction_generator,
                                output_shapes,
                                num_classes,
                                chunk_shape=(32, 64, 64),
+                               label_shape=(32, 64, 64),
                                overlap=(0, 0, 0),
+                               sub_bbox=None,
                                axes='zyx',
                                mpi=False):
   '''Sequentially write chunks(with overlap) from volumes'''
   chunk_shape = np.array(chunk_shape)
-  chunk_offset = chunk_shape // 2
+  label_shape = np.array(label_shape)
   overlap = np.array(overlap)
-  if axes == 'zyx':
-    chunk_shape = chunk_shape[::-1]
-    chunk_offset = chunk_offset[::-1]
-    overlap = chunk_shape[::-1]
-
-  step_shape = chunk_shape - overlap
+  # chunk_offset = chunk_shape // 2
+  # overlap = np.array(overlap)
+  # if axes == 'zyx':
+  #   chunk_shape = chunk_shape[::-1]
+  #   chunk_offset = chunk_offset[::-1]
+    # overlap = chunk_shape[::-1]
+  # step_shape = chunk_shape - overlap
   output_volume_map = {}
   
   for vol in output_volumes.split(','):
@@ -317,33 +300,69 @@ def h5_sequential_chunk_writer_v2(prediction_generator,
 
     output_shape = output_shapes[volname]
     logging.warn('output_shape %s', output_shape)
-    output_volume_map[volname] = f.create_dataset(name=dataset, shape=output_shape, dtype='float32')
+    logits_ds = f.create_dataset(name='logits', shape=list(output_shape)+[num_classes], dtype='float32') 
+    class_prediction_ds = f.create_dataset(name='class_prediction', shape=output_shape, dtype='float32')
     # output_volume = np.zeros(shape=output_shapes[volname], dtype=np.float32)
     max_bbox = bounding_box.BoundingBox(start=(0,0,0), size=output_shapes[volname][::-1])
     logging.warn('bbox %s', max_bbox)
     for p in prediction_generator:
-      center, pred = p['center'], p['class_prediction']
-      logging.warn('pred shape %s %s', center, pred.shape)
-      pad_w_start = center - chunk_shape // 2 + overlap // 2
-      pad_w_end = center + (chunk_shape+1) // 2 - overlap // 2
-      coord_offset = overlap // 2
-      w_start = pad_w_start - coord_offset
-      w_end = pad_w_end - coord_offset
-      logging.warn('diagnose_1 %s %s %s', center, pad_w_start, coord_offset)
-      logging.warn('diagnose_2 %s %s', w_start, w_end)
+      center, logits, class_prediction = p['center'][0], p['logits'], p['class_prediction']
+      # logging.warn('pred shape %s %s', center, pred.shape)
+      # pad_w_start = center - chunk_shape // 2 + overlap // 2
+      # pad_w_end = center + (chunk_shape+1) // 2 - overlap // 2
+      # coord_offset = overlap // 2
+      # w_start = pad_w_start - coord_offset
+      # w_end = pad_w_end - coord_offset
+      # logging.warn('diagnose_1 %s %s %s', center, pad_w_start, coord_offset)
+      # logging.warn('diagnose_2 %s %s', w_start, w_end)
       
-      write_bbox = bounding_box.BoundingBox(start=w_start, end=w_end)
-      logging.warn('write_bbox %s, %s', center, write_bbox.size)
+      # write_bbox = bounding_box.BoundingBox(start=w_start, end=w_end)
+      # logging.warn('write_bbox %s, %s', center, write_bbox.size)
       
-      write_bbox = bounding_box.intersection(write_bbox, max_bbox)
-      read_bbox = bounding_box.BoundingBox(start=coord_offset, size=write_bbox.size)
+
+      # write_bbox = bounding_box.intersection(write_bbox, max_bbox)
+      # read_bbox = bounding_box.BoundingBox(start=coord_offset, size=write_bbox.size)
       
-      write_slices = write_bbox.to_slice()
-      read_slices = read_bbox.to_slice()
-      write_slices = tuple([write_slices[i] for i in [2,1,0]])
-      read_slices = tuple([read_slices[i] for i in [2,1,0]])
-      logging.warn('pred shape %s', pred[read_slices].shape)
-      output_volume_map[volname][write_slices] = pred[read_slices]
+      # write_slices = write_bbox.to_slice()
+      # read_slices = read_bbox.to_slice()
+      # write_slices = tuple([write_slices[i] for i in [2,1,0]])
+      # read_slices = tuple([read_slices[i] for i in [2,1,0]])
+
+      # r_start = chunk_shape // 2 - label_shape // 2 + overlap // 2
+
+      # deal with initial boarders
+      if (center - label_shape // 2 == 0).any():
+        r_start = np.array([0,0,0])
+        w_start = center - label_shape // 2
+        r_size = label_shape
+        w_size = label_shape
+      else:
+        r_start = overlap // 2
+        w_start = center - label_shape // 2 + overlap // 2
+        r_size = label_shape - overlap // 2
+        w_size = label_shape - overlap // 2
+      # logging.warning('io: %s, %s, %s, %s, %s', center, r_start, r_size, w_start, w_size)
+
+      r_slc = np.s_[
+        r_start[2]:r_start[2] + r_size[2],
+        r_start[1]:r_start[1] + r_size[1],
+        r_start[0]:r_start[0] + r_size[0],
+      ]
+      w_slc = np.s_[
+        w_start[2]:w_start[2] + w_size[2],
+        w_start[1]:w_start[1] + w_size[1],
+        w_start[0]:w_start[0] + w_size[0],
+      ]
+      # logging.warning('slc: %s, %s', r_slc, w_slc)
+      # print(logits.shape)
+      # logits_ds[w_slc] = logits[r_slc]
+      # class_prediction_ds[w_slc] = class_prediction[r_slc]
+      logits_ds[w_slc] = logits[r_slc]
+      class_prediction_ds[w_slc] = class_prediction[r_slc]
+
+
+      # logging.warn('pred shape %s', pred[read_slices].shape)
+      # output_volume_map[volname][write_slices] = pred[read_slices]
 #       output_volume[write_slices] = pred[read_slices+(0,)]
     f.close()
 
@@ -370,7 +389,7 @@ def soft_filter(label):
   logging.warn('predicate %s', predicate)
   return predicate
 
-def train_input_fn(data_volumes, label_volumes, num_classes, chunk_shape, label_shape, batch_size, offset, scale):
+def train_input_fn_old(data_volumes, label_volumes, num_classes, chunk_shape, label_shape, batch_size, offset, scale):
   '''An tf.data.Dataset from h5 file containing'''
   h5_chunk_gen = h5_random_chunk_generator(data_volumes, label_volumes, num_classes, chunk_shape)
   ds = tf.data.Dataset.from_generator(
@@ -405,7 +424,8 @@ def load_from_numpylike(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
   # chunk_shape_xyz = np.array(chunk_shape[::-1])
   chunk_shape = np.array(chunk_shape)
   def _load_from_numpylike(coord):
-    starts = np.array(coord[0]) - (chunk_shape-1) // 2
+    # starts = np.array(coord[0]) - (chunk_shape-1) // 2
+    starts = np.array(coord[0]) - chunk_shape // 2
     slc = bounding_box.BoundingBox(start=starts, size=chunk_shape).to_slice()
     # slc is in z,y,x order
     # logging.warn('loading from %s %s, %s, %s', starts, chunk_shape, slc, volume.shape)
@@ -432,6 +452,46 @@ def load_from_numpylike(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
     logging.warn('after %s', loaded.shape)
     return loaded
 
+def load_from_numpylike_with_pad(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
+  """ Load a chunk from numpylike volume.
+
+  Args:
+    coord: Tensor of shape (3,) in xyz order
+    volume: A numpy like volume
+    chunk_shape: 3-tuple/list of shape in xyz
+    volume_axes: specify the axis order in volume
+  Returns:
+    Tensor loaded with data from coord
+  """
+  # chunk_shape_xyz = np.array(chunk_shape[::-1])
+  chunk_shape = np.array(chunk_shape)
+  def _load_from_numpylike(coord):
+    starts = np.array(coord[0]) - (chunk_shape-1) // 2
+    slc = bounding_box.BoundingBox(start=starts, size=chunk_shape).to_slice()
+    # slc is in z,y,x order
+    logging.warning('loading from %s %s, %s, %s', starts, chunk_shape, slc, volume.shape)
+    if volume_axes == 'zyx':
+      data = volume[slc[0], slc[1], slc[2], :]
+    elif volume_axes == 'xyz':
+      data = volume[slc[2], slc[1], slc[0], :]
+    else:
+      raise ValueError('volume_axes mush either be "zyx" or "xyz"')
+    # logging.warn('loaded data %s ', data.shape)
+    # assert (data.shape[1:4] == chunk_shape[::-1]).all()
+    # logging.error('shape_check %s, %s', data.shape[0:3], chunk_shape[::-1])
+    return data
+  dtype = volume.dtype
+  num_classes = volume.shape[-1]
+  logging.warn('weird class: %d %s', num_classes, volume.shape)
+  with tf.name_scope('load_from_h5') as scope:
+    loaded = tf.py_func(
+        _load_from_numpylike, [coord_tensor], [dtype],
+        name=scope)[0]
+    # logging.warn('before %s', loaded.shape)
+    # loaded.set_shape([1] + list(chunk_shape[::-1]) + [num_classes])
+    loaded.set_shape(list(chunk_shape[::-1]) + [num_classes])
+    logging.warn('after %s', loaded.shape)
+    return loaded
 def filter_out_of_bounds(coord, chunk_shape, max_shape):
   logging.warn('filter %s %s %s', coord, chunk_shape, max_shape)
   # if image.shape.as_list()[1:4] == list(chunk_shape)[::-1]:
@@ -459,49 +519,31 @@ def get_full_size(chunk_size, label_size):
   return new_chunk_size, new_label_size
 
   
+
 def random_rotate(coord, image, labels, chunk_shape, label_shape):
   angle = np.random.rand() * 2 * np.pi
-  # image_rot = tf.contrib.image.rotate(image, angle)
-  # labels_rot = tf.contrib.image.rotate(labels, angle)
-  # logging.warning('rotated_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
-  # image_crop = crop_v2(image_rot, crop_shape=chunk_shape)
-  # labels_crop = crop_v2(labels_rot, crop_shape=label_shape)
-  # logging.warning('cropped_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
-  with tf.device('/cpu:0'):
-    image = tf.contrib.image.rotate(image, angle)
-    labels = tf.contrib.image.rotate(labels, angle)
-    # logging.warning('rotated_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
-    image= crop_v3(image, crop_shape=chunk_shape)
-    labels= crop_v3(labels, crop_shape=label_shape)
-  # logging.warning('cropped_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
-    return coord, image, labels
+  # with tf.device('/cpu:0'):
+  image = tf.contrib.image.rotate(image, angle, name='rot_im')
+  labels = tf.contrib.image.rotate(labels, angle, name='rot_lb')
+  image_offset = np.array(image.shape.as_list())[1:3] // 2 - np.array(chunk_shape)[0:2] // 2
+  label_offset = np.array(labels.shape.as_list())[1:3] // 2 - np.array(label_shape)[0:2] // 2
+  # off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
+  logging.warning('offsets: %s %s', image_offset, label_offset)
+  image= tf.image.crop_to_bounding_box(image, image_offset[0], image_offset[1], chunk_shape[0], chunk_shape[1])
+  labels= tf.image.crop_to_bounding_box(labels, label_offset[0], label_offset[1], label_shape[0], label_shape[1])
+  logging.warning('post offset shapes: %s %s', image.shape, labels.shape)
+  return coord, image, labels
 
-def random_rotate_v2(coord, image, labels, chunk_shape, label_shape):
-  angle = np.random.rand() * 2 * np.pi
-  with tf.device('/cpu:0'):
-    image = tf.contrib.image.rotate(image, angle, name='rot_im')
-    labels = tf.contrib.image.rotate(labels, angle, name='rot_lb')
-    # logging.warning('rotated_shapes %f %s %s', angle, image_rot.shape, labels_rot.shape)
-    image_offset = np.array(image.shape.as_list())[1:3] // 2 - np.array(chunk_shape)[0:2] // 2
-    label_offset = np.array(labels.shape.as_list())[1:3] // 2 - np.array(label_shape)[0:2] // 2
-    # off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
-    logging.warning('offsets: %s %s', image_offset, label_offset)
-    image= tf.image.crop_to_bounding_box(image, image_offset[0], image_offset[1], chunk_shape[0], chunk_shape[1])
-    labels= tf.image.crop_to_bounding_box(labels, label_offset[0], label_offset[1], label_shape[0], label_shape[1])
-    logging.warning('post offset shapes: %s %s', image.shape, labels.shape)
-    return coord, image, labels
-
-def train_input_fn_v2(data_volumes, 
-                      label_volumes, 
-                      tf_coords,
-                      num_classes, 
-                      chunk_shape, 
-                      label_shape, 
-                      batch_size, 
-                      offset, 
-                      scale,
-                      rotation=False):
-  # def h5_coord_chunk_dataset(data_volumes, label_volumes, tf_coords, num_classes, chunk_shape, label_shape):
+def train_input_fn(data_volumes, 
+                   label_volumes, 
+                   tf_coords,
+                   num_classes, 
+                   chunk_shape, 
+                   label_shape, 
+                   batch_size, 
+                   offset, 
+                   scale,
+                   rotation=False):
   def h5_coord_chunk_dataset():
     image_volume_map = {}
     for vol in data_volumes.split(','):
@@ -518,15 +560,18 @@ def train_input_fn_v2(data_volumes,
         label_volume_map[volname] = np.expand_dims(h5py.File(path, 'r')[dataset], axis=-1)
         
 
-    for key in image_volume_map: # assume only one key in the map for now
+    for key in image_volume_map: # Currently only works with one key in the map
       if rotation:
         pre_chunk_shape, pre_label_shape = get_full_size(chunk_shape, label_shape)
       else:
-        pre_chunk_shape = chunk_shape
-        pre_label_shape = label_shape
-      logging.warning('pre shapes: %s %s', pre_chunk_shape, pre_label_shape)
+        pre_chunk_shape, pre_label_shape = chunk_shape, label_shape
+
+      logging.warning('pre rotation shapes: %s %s', pre_chunk_shape, pre_label_shape)
 
       max_shape = image_volume_map[key].shape
+      label_scale = 1.0 if num_classes > 1 else 2.0 # convert 0-1 to -0.5, 0.5 for regression model
+      label_offset = 0.0 if num_classes > 1 else -0.5 # convert 0-1 to -0.5, 0.5 for regression model
+
       # fnames = tf.matching_files(tf_coords+'*')
       # logging.info('fnames %s', fnames)
       # ds = tf.data.TFRecordDataset(fnames, compression_type='GZIP')
@@ -539,7 +584,7 @@ def train_input_fn_v2(data_volumes,
       ds = files.apply(
         tf.data.experimental.parallel_interleave(
           lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
-          cycle_length=1
+          cycle_length=2
         )
       )
       # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'), cycle_length=2)
@@ -554,11 +599,10 @@ def train_input_fn_v2(data_volumes,
       ds = ds.map(lambda coord, image, label: (
           coord, 
           preprocess_image(image, offset, scale),
-          # preprocess_edt_labels(label)),
-          tf.cast(label, tf.float32)), 
+          tf.cast(label, tf.float32) * label_scale + label_offset), 
         num_parallel_calls=tf.data.experimental.AUTOTUNE)
       if rotation:
-        ds = ds.map(lambda coord, image, label: random_rotate_v2(
+        ds = ds.map(lambda coord, image, label: random_rotate(
           coord, image, label, chunk_shape, label_shape), 
           num_parallel_calls=tf.data.experimental.AUTOTUNE)         
       ds = ds.map(lambda coord, image, label: (
@@ -597,170 +641,244 @@ def predict_input_fn(data_volumes, chunk_shape,
   }
   return features
 
-# def predict_input_fn_v2(data_volumes,
-#                         chunk_shape,
-#                         overlap,
-#                         batch_size,
-#                         offset,
-#                         scale,
-#                         bounding_box, 
-#                         var_threshold):
-#   bbox = bounding_box_pb2.BoundingBox()
-#   text_format.Parse(bounding_box, bbox)
-#   def h5_sequential_chunk_dataset():
-#     pass
+def predict_input_fn_v2(data_volumes,
+                        chunk_shape,
+                        label_shape,
+                        overlap,
+                        batch_size,
+                        offset,
+                        scale,
+                        sub_bbox, 
+                        var_threshold):
+
+  if sub_bbox is not None:
+    bbox = bounding_box_pb2.BoundingBox()
+    text_format.Parse(sub_bbox, bbox)
+  else:
+    # in x, y, z
+    start = (0, 0, 0)
+    size = next(iter(get_h5_shapes(data_volumes).values()))
+    logging.warn('shapes: %s %s', start, size)
+    bbox = bounding_box.BoundingBox(start=start, size=size[::-1])
+
+  logging.warning('bbox: %s', bbox)
+  # in/out shape discrepency due to size shrinking after conv pool layers
+  in_out_diff = (np.array(chunk_shape) - np.array(label_shape)) // 2
+  overlap_padded = overlap + in_out_diff
+
+  image_volume_map = {}
+  for vol in data_volumes.split(','):
+    volname, path, dataset = vol.split(':')
+    image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+  # assume only one volname key in inference
 
 
+  def h5_sequential_bbox_gen():
+    calc = bounding_box.OrderlyOverlappingCalculator(
+      outer_box=bbox, 
+      sub_box_size=chunk_shape, 
+      overlap=overlap_padded, 
+      include_small_sub_boxes=True,
+      back_shift_small_sub_boxes=True)
+    for bb in calc.generate_sub_boxes():
+      yield [bb.start + bb.size // 2] # central coord which is io'ed
 
-
-def ortho_cut(volume, batch_size):
-  '''Concat orthogonal cuts'''
-  _,z,y,x,c = volume.get_shape().as_list()
-  b = batch_size
-  #print(b,z,y,x,c)
-  yx = volume[0:b,z//2,:,:,:]
-  zx = volume[0:b,:,y//2,:,:]
-  zy = volume[0:b,:,:,x//2,:]
-  logging.warn('volshape: %s', volume.shape)
-  yz = tf.transpose(zy, perm=[0, 2, 1, 3])
-  zz_pad = tf.zeros([b, z, z, c], dtype=tf.float32)
-  logging.warn('cut: %s, %s, %s, %s', yx.shape, yz.shape, zx.shape, zz_pad.shape)
-  output = tf.concat(
-    [tf.concat([yx, yz], axis=2),
-     tf.concat([zx, zz_pad], axis=2)],
-    axis=1)
-  return output
-
-def ortho_project(volume, batch_size):
-  '''Concat orthogonal cuts'''
-  b,z,y,x,c = volume.get_shape().as_list()
-  # b = batch_size
-  # convert first dim to 0
-  # zero_first = tf.zeros([b, z, y, x, 1], dtype=tf.float32)
-  # new_volume = tf.concat([zero_first, volume[...,1:]], axis=-1)
-  # logging.warn('old_volume_shape: %s', volume.shape)
-  # logging.warn('new_volume_shape: %s', new_volume.shape)
-  #print(b,z,y,x,c)
-  yx = volume[0:b,z//2,:,:,:]
-  zx = volume[0:b,:,y//2,:,:]
-  zy = volume[0:b,:,:,x//2,:]
-  # yx = tf.reduce_mean(new_volume, axis=1)
-  # zx = tf.reduce_mean(new_volume, axis=2)
-  # zy = tf.reduce_mean(new_volume, axis=3)
-  yz = tf.transpose(zy, perm=[0, 2, 1, 3])
-  zz_pad = tf.zeros([b, z, z, c], dtype=tf.float32)
-  output = tf.concat(
-    [tf.concat([yx, yz], axis=2),
-     tf.concat([zx, zz_pad], axis=2)],
-    axis=1)
-  return output
-def ortho_project_rgb(volume, batch_size):
-  b,z,y,x,c = volume.get_shape().as_list()
-  #b = batch_size
-  # convert first dim to 0, which is default background
-  zero_first = tf.zeros([b, z, y, x, 1], dtype=tf.float32)
-  new_volume = tf.concat([zero_first, volume[...,1:]], axis=-1)
-
-  color_palette = tf.constant([
-    [1,0,0],
-    [0,1,0],
-    [0,0,1],
-    [1,1,0],
-    [0,1,1],
-    [1,0,1]], tf.float32)
-  
-  rgb_volume = tf.reshape(
-    tf.matmul(
-      tf.reshape(new_volume, [-1, c]), color_palette[:c]),
-    [b,z,y,x,3]
+  ds = tf.data.Dataset.from_generator(
+    generator=h5_sequential_bbox_gen, 
+    output_types=(tf.int64), 
+    output_shapes=(tf.TensorShape((1,3)))
   )
-
-
-
-
-  yx = tf.reduce_mean(rgb_volume, axis=1)
-  zx = tf.reduce_mean(rgb_volume, axis=2)
-  zy = tf.reduce_mean(rgb_volume, axis=3)
-  yz = tf.transpose(zy, perm=[0, 2, 1, 3])
-  zz_pad = tf.zeros([b, z, z, 3], dtype=tf.float32)
-  output = tf.concat(
-    [tf.concat([yx, yz], axis=2),
-     tf.concat([zx, zz_pad], axis=2)],
-    axis=1)
-  return output
-
-
-
-
-def mask_model_fn(features, labels, mode, params):
-
-  model_class = params['model_class']
-  model_args = params['model_args']
-  batch_size = params['batch_size']
-  logging.warn('at mask_model %s', features['image'].shape)
-  outputs = model_class(features['image'], params['num_classes'])
-  class_prediction = tf.argmax(outputs, axis=-1)
-  predictions = {
-    'center': features['center'],
-    'logits': outputs,
-    'class_prediction': class_prediction 
-  }
-  logging.warn('features in mask model %s, %s', features['center'], features['image'])
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    center_op = tf.identity(features['center'], name='center')
-    return tf.estimator.EstimatorSpec(mode, predictions=predictions)
-  
-  # loss = tf.losses.sigmoid_cross_entropy(
-  #   labels,
-  #   outputs,
-  #   weights=1.0,
-  #   label_smoothing=0,
+  ds = ds.apply(
+    tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
+  ds = ds.map(lambda coord: (
+      coord, 
+      load_from_numpylike(coord, image_volume_map[volname], chunk_shape)),
+     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
+     num_parallel_calls=tf.data.experimental.AUTOTUNE)
   # )
-  loss = tf.losses.mean_squared_error(
-    labels,
-    outputs,
-  )
-  if mode == tf.estimator.ModeKeys.TRAIN:
-    # optimizer = tf.train.AdagradOptimizer(learning_rate=0.1*hvd.size())
-    # optimizer = tf.train.MomentumOptimizer(
-    #         learning_rate=0.001 * hvd.size(), momentum=0.9)
-          
-    optimizer = tf.train.AdamOptimizer(
-            learning_rate=0.001 * hvd.size(),
-            beta1=0.9,
-            beta2=0.999,
-            epsilon=1e-08)
-    # optimizer =tf.train.RMSPropOptimizer(
-    #   learning_rate=0.001 * hvd.size(),
-    #   decay=0.9,
-    #   momentum=0.0,
-    #   epsilon=1e-10,
-    # )
-    optimizer = hvd.DistributedOptimizer(optimizer, name='distributed_optimizer')
+    # num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.map(lambda coord, image:
+    {
+      'center': coord,
+      'image': image
+    },
+    num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.batch(batch_size)
+  return ds
 
-
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
-    tf.summary.image('image', ortho_cut(features['image'], batch_size), 
-      max_outputs=batch_size)
-    tf.summary.image('labels', ortho_project(labels, batch_size), 
-      max_outputs=batch_size)
-    tf.summary.image('output', ortho_project(outputs, batch_size), 
-      max_outputs=batch_size)
-    return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+def get_h5_shape(input_path, axes='zyx'):
+  volname, path, dataset = input_path.split(':')
+  with h5py.File(path, 'r'):
+    shape = f[dataset].shape
+    if axes == 'zyx':
+      shape = shape[::-1]
+    elif axes == 'xyz':
+      pass
+    else:
+      raise ValueError('must be zyx or xyz')
+    return shape
     
-  
-  elif mode == tf.estimator.ModeKeys.EVAL:
-    accuracy = tf.metrics.accuracy(labels=labels,
-                                   predictions=predictions['mask'],
-                                   name='acc_op')
-    metrics = {
-      'accuracy': accuracy
-    }
-    tf.summary.scalar('accuracy', accuracy[1])
-    return tf.estimator.EstimatorSpec(
-      mode, loss=loss, eval_metric_ops=metrics)
+
+
+def predict_input_fn_h5(input_volume,
+                        input_offset, 
+                        input_size,
+                        chunk_shape,
+                        label_shape,
+                        overlap,
+                        batch_size,
+                        offset,
+                        scale,
+                        var_threshold):
+
+  volname, path, dataset = input_volume.split(':')
+  if input_offset is None or input_size is None:
+    with h5py.File(path, 'r') as f:
+      input_size = f[dataset].shape[::-1]
+    input_offset = (0, 0, 0)
+  slc = np.s_[
+    input_offset[2]:input_offset[2]+input_size[2],
+    input_offset[1]:input_offset[1]+input_size[1],
+    input_offset[0]:input_offset[0]+input_size[0],
+    ]
+  logging.warn('slc: %s', slc)
+
+  with h5py.File(path, 'r') as f:
+    data = np.expand_dims(f[dataset][slc], axis=-1)
+  logging.warning('input_shape %s', data.shape)
+  # this bbox coord is relative to offset 
+  bbox = bounding_box.BoundingBox(start=[0,0,0], size=input_size)
+
+  in_out_diff = (np.array(chunk_shape) - np.array(label_shape)) // 2
+  overlap_padded = overlap + in_out_diff
+  def h5_sequential_bbox_gen():
+    calc = bounding_box.OrderlyOverlappingCalculator(
+      outer_box=bbox, 
+      sub_box_size=chunk_shape, 
+      overlap=overlap_padded, 
+      include_small_sub_boxes=True,
+      back_shift_small_sub_boxes=True)
+    for bb in calc.generate_sub_boxes():
+      yield [bb.start + bb.size // 2] # central coord which is io'ed
+
+  ds = tf.data.Dataset.from_generator(
+    generator=h5_sequential_bbox_gen, 
+    output_types=(tf.int64), 
+    output_shapes=(tf.TensorShape((1,3)))
+  )
+  ds = ds.apply(
+    tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
+  ds = ds.map(lambda coord: (
+      coord, 
+      load_from_numpylike(coord, data, chunk_shape)),
+     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
+     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  # )
+    # num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.map(lambda coord, image:
+    {
+      'center': coord,
+      'image': image
+    },
+    num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.batch(batch_size)
+  return ds
+
+def predict_input_fn_precomputed(
+  input_volume,
+  input_offset,
+  input_size,
+  chunk_shape,
+  label_shape,
+  overlap,
+  batch_size,
+  offset,
+  scale,
+  var_threshold):
+
+  if input_offset is None or input_size is None:
+  #   full_input = cloudvolume.CloudVolume('file://%s' % input_volume, mip=0, parallel=True, progress=False)
+  #   slc = np.s_[
+  #     input_offset[0]:input_offset[0]+input_size[0],
+  #     input_offset[1]:input_offset[1]+input_size[1],
+  #     input_offset[2]:input_offset[2]+input_size[2],
+  #     :
+  #     ]
+  #   data = np.transpose(full_input[slc], [2,1,0,3])
+
+  # else:
+    # in x, y, z
+    full_input = cloudvolume.CloudVolume('file://%s' % input_volume, mip=0, parallel=True, progress=False)
+    input_offset = (0, 0, 0)
+    input_size = full_input.shape()
+  slc = np.s_[
+    input_offset[0]:input_offset[0]+input_size[0],
+    input_offset[1]:input_offset[1]+input_size[1],
+    input_offset[2]:input_offset[2]+input_size[2],
+    :
+    ]
+  logging.warn('shapes: %s %s', start, size)
+  # data = full_input[slc]
+  data = np.transpose(full_input[slc], [2,1,0,3])
+  # bbox = bounding_box.BoundingBox(start=start, size=size[::-1])
+  logging.warning('input_shape %s', data.shape)
+                    
+  # offset_xyz = np.array(offset_xyz)
+  # size_xyz = np.array(size_xyz)
+  # bbox = cloudvolume.Bbox(offset_xyz, offset_xyz + size_xyz) 
+
+  # logging.warning('bbox: %s', bbox)
+
+  # in/out shape discrepency due to size shrinking after conv pool layers
+  in_out_diff = (np.array(chunk_shape) - np.array(label_shape)) // 2
+  overlap_padded = overlap + in_out_diff
+
+  # image_volume_map = {}
+  # for vol in data_volumes.split(','):
+  #   volname, path, dataset = vol.split(':')
+  #   image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+  # assume only one volname key in inference
+
+  bbox = bounding_box.BoundingBox(start=[0,0,0], size=input_size)
+  logging.warn('global bbox: %s', bbox)
+  def h5_sequential_bbox_gen():
+    calc = bounding_box.OrderlyOverlappingCalculator(
+      outer_box=bbox, 
+      sub_box_size=chunk_shape, 
+      overlap=overlap_padded, 
+      include_small_sub_boxes=True,
+      back_shift_small_sub_boxes=True)
+    for bb in calc.generate_sub_boxes():
+      yield [bb.start + bb.size // 2] # central coord which is io'ed
+
+  ds = tf.data.Dataset.from_generator(
+    generator=h5_sequential_bbox_gen, 
+    output_types=(tf.int64), 
+    output_shapes=(tf.TensorShape((1,3)))
+  )
+  ds = ds.apply(
+    tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
+  ds = ds.map(lambda coord: (
+      coord, 
+      load_from_numpylike(coord, data, chunk_shape)),
+     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
+     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  # )
+    # num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.map(lambda coord, image:
+    {
+      'center': coord,
+      'image': image
+    },
+    num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.batch(batch_size)
+  return ds
+
+
+
 def crop_v2(tensor, crop_shape, offset=(0, 0, 0), batched=False):
   """Extracts 'crop_shape' around 'offset' from 'tensor'.
 
@@ -846,191 +964,3 @@ def crop_v3(tensor, crop_shape, offset=(0, 0, 0), batched=False):
       tensor = tf.squeeze(tensor, axis=0)
 
     return tensor
-
-def mask_model_fn_v2(features, labels, mode, params):
-  model_class = params['model_class']
-  model_args = params['model_args']
-  batch_size = params['batch_size']
-  learning_rate = params['learning_rate']
-
-  fov_size = model_args['fov_size']
-  label_size = model_args['label_size']
-
-  logging.warn('>> shapes: %s %s', fov_size, label_size)
-
-
-  # crop_labels = crop_v2(labels, np.zeros((3,), np.int32), np.array(label_size)[::-1])
-  outputs = model_class(features['image'], params['num_classes'])
-  # logits = tf.nn.softmax(outputs)
-  class_prediction = tf.argmax(outputs, axis=-1)
-  predictions = {
-    'center': features['center'],
-    'mask': outputs,
-    'class_prediction': class_prediction 
-  }
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    center_op = tf.identity(features['center'], name='center')
-    return tf.estimator.EstimatorSpec(mode, predictions=predictions)
-  
-  # loss = tf.losses.sigmoid_cross_entropy(
-  #   labels,
-  #   outputs,
-  #   weights=1.0,
-  #   label_smoothing=0,
-  # )
-  # one_hot_class_prediction = tf.one_hot(class_prediction, params['num_classes'])
-  # logging.warn('loss %s %s', labels.shape, outputs.shape)
-  flat_logits = tf.reshape(outputs, (-1, params['num_classes']), name='flat_logits')
-  flat_labels = tf.reshape(labels, (-1, params['num_classes']), name='flat_labels')
-
-  # first weight is zero, the later will evenly split 1.0
-  # weights_template = tf.constant([0.9 / (params['num_classes']-1) if i != 0 else 0.1 for i in range(params['num_classes'])])
-  # logging.warning('weights %s', weights_template)
-  # flat_weights = tf.gather(weights_template, tf.argmax(flat_labels, axis=-1), name='flat_weights')
-  
-  loss = tf.losses.softmax_cross_entropy(
-    onehot_labels=flat_labels,
-    logits=flat_logits,
-    # weights=flat_weights,
-    label_smoothing=0.05
-  )
-  # loss = tf.losses.sigmoid_cross_entropy(
-  #   multi_class_labels=flat_labels,
-  #   logits=flat_logits,
-  #   label_smoothing=0.05)
-  if mode == tf.estimator.ModeKeys.TRAIN:
-    # optimizer = tf.train.AdagradOptimizer(learning_rate=learning_rate * hvd.size())
-    # optimizer = tf.train.MomentumOptimizer(
-    #         learning_rate=learning_rate * hvd.size(), momentum=0.9)
-          
-    optimizer = tf.train.AdamOptimizer(
-            learning_rate=learning_rate * hvd.size(),
-            beta1=0.9,
-            beta2=0.999,
-            epsilon=1e-08)
-    # optimizer = tf.keras.optimizers.SGD(
-    #   lr=learning_rate * hvd.size(),
-    # )
-    # optimizer =tf.train.RMSPropOptimizer(
-    #   learning_rate=learning_rate * hvd.size(),
-    #   decay=0.9,
-    #   momentum=0.0,
-    #   epsilon=1e-10,
-    # )
-    optimizer = hvd.DistributedOptimizer(optimizer, name='distributed_optimizer')
-
-
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
-    tf.summary.image('image', ortho_cut(features['image'], batch_size), 
-      max_outputs=batch_size)
-    tf.summary.image('labels', ortho_project_rgb(labels, batch_size), 
-      max_outputs=batch_size)
-    tf.summary.image('output', ortho_project_rgb(outputs, batch_size), 
-      max_outputs=batch_size)
-    return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
-    
-  
-  elif mode == tf.estimator.ModeKeys.EVAL:
-    accuracy = tf.metrics.accuracy(labels=labels,
-                                   predictions=predictions['mask'],
-                                   name='acc_op')
-    metrics = {
-      'accuracy': accuracy
-    }
-    tf.summary.scalar('accuracy', accuracy[1])
-    return tf.estimator.EstimatorSpec(
-      mode, loss=loss, eval_metric_ops=metrics)
-
-def mask_model_fn_edt(features, labels, mode, params):
-  '''Euclidean distance models.
-  
-  The logits won't be classification but regression, num class should be 1
-  
-  
-  '''
-  model_class = params['model_class']
-  model_args = params['model_args']
-  batch_size = params['batch_size']
-  learning_rate = params['learning_rate']
-
-  fov_size = model_args['fov_size']
-  label_size = model_args['label_size']
-
-  logging.warn('>> shapes: %s %s', fov_size, label_size)
-
-
-  # crop_labels = crop_v2(labels, np.zeros((3,), np.int32), np.array(label_size)[::-1])
-  outputs = model_class(features['image'], params['num_classes'])
-  # logits = tf.nn.softmax(outputs)
-  # class_prediction = tf.argmax(outputs, axis=-1)
-  predictions = {
-    'center': features['center'],
-    'mask': outputs,
-    # 'class_prediction': class_prediction 
-  }
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    center_op = tf.identity(features['center'], name='center')
-    return tf.estimator.EstimatorSpec(mode, predictions=predictions)
-  
-  # loss = tf.losses.sigmoid_cross_entropy(
-  #   labels,
-  #   outputs,
-  #   weights=1.0,
-  #   label_smoothing=0,
-  # )
-  # one_hot_class_prediction = tf.one_hot(class_prediction, params['num_classes'])
-  logging.warn('loss %s %s', labels.shape, outputs.shape)
-  flat_logits = tf.reshape(outputs, (-1, params['num_classes']), name='flat_logits')
-  flat_labels = tf.reshape(labels, (-1, params['num_classes']), name='flat_labels')
-  # loss = tf.losses.softmax_cross_entropy(
-  #   onehot_labels=flat_labels,
-  #   logits=flat_logits,
-  #   label_smoothing=0.05
-  # )
-  loss = tf.losses.mean_squared_error(
-    flat_labels,
-    flat_logits,
-  )
-  if mode == tf.estimator.ModeKeys.TRAIN:
-    # optimizer = tf.train.AdagradOptimizer(learning_rate=0.1*hvd.size())
-    # optimizer = tf.train.MomentumOptimizer(
-    #         learning_rate=0.001 * hvd.size(), momentum=0.9)
-          
-    optimizer = tf.train.AdamOptimizer(
-            learning_rate=learning_rate * hvd.size(),
-            beta1=0.9,
-            beta2=0.999,
-            epsilon=1e-08)
-    # optimizer =tf.train.RMSPropOptimizer(
-    #   learning_rate=0.001 * hvd.size(),
-    #   decay=0.9,
-    #   momentum=0.0,
-    #   epsilon=1e-10,
-    # )
-    optimizer = hvd.DistributedOptimizer(optimizer, name='distributed_optimizer')
-
-
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
-    tf.summary.image('image', ortho_cut(features['image'], batch_size), 
-      max_outputs=batch_size)
-    tf.summary.image('labels', ortho_project(labels, batch_size), 
-      max_outputs=batch_size)
-    tf.summary.image('output', ortho_project(outputs, batch_size), 
-      max_outputs=batch_size)
-    return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
-    
-  
-  elif mode == tf.estimator.ModeKeys.EVAL:
-    accuracy = tf.metrics.accuracy(labels=labels,
-                                   predictions=predictions['mask'],
-                                   name='acc_op')
-    metrics = {
-      'accuracy': accuracy
-    }
-    tf.summary.scalar('accuracy', accuracy[1])
-    return tf.estimator.EstimatorSpec(
-      mode, loss=loss, eval_metric_ops=metrics)

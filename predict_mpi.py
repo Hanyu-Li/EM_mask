@@ -15,15 +15,15 @@ from skimage.segmentation import find_boundaries
 from ffn.utils import bounding_box
 from ffn.training import inputs
 from ffn.training.import_util import import_symbol
-from ffn_mask import utils as mask_utils
+from ffn_mask import io_utils, model_utils
 
-# import horovod.tensorflow as hvd
+import horovod.tensorflow as hvd
 import sys
-from mpi4py import MPI
+# from mpi4py import MPI
 import json
 
-comm = MPI.COMM_WORLD
-rank = comm.rank
+# comm = MPI.COMM_WORLD
+# rank = comm.rank
 
 FLAGS = flags.FLAGS
 
@@ -53,11 +53,17 @@ flags.DEFINE_float('image_stddev', 33, '')
 flags.DEFINE_integer('max_steps', 100000, '')
 flags.DEFINE_boolean('mpi', False, '')
 
+
 def main(unused_argv):
   hvd.init()
   model_class = import_symbol(FLAGS.model_name, 'ffn_mask')
   model_args = json.loads(FLAGS.model_args)
   fov_size= tuple([int(i) for i in model_args['fov_size']])
+  if 'label_size' in model_args:
+    label_size = tuple([int(i) for i in model_args['label_size']])
+  else:
+    label_size = fov_size
+    model_args['label_size'] = label_size
   overlap = [int(i) for i in FLAGS.overlap]
   num_classes = int(model_args['num_classes'])
   params = {
@@ -72,67 +78,77 @@ def main(unused_argv):
   sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
 
 
+  if num_classes == 1:
+    model_fn = model_utils.mask_model_fn_regression  
+  else:
+    model_fn = model_utils.mask_model_fn_classfication
+
   model_checkpoint = FLAGS.model_checkpoint if hvd.rank() == 0 else None
 
   config=tf.estimator.RunConfig( 
-    # model_dir=model_dir,
-    # save_summary_steps=save_summary_steps,
-    # save_checkpoints_secs=save_checkpoints_secs,
     session_config=sess_config,
-    # keep_checkpoint_max=1000,
   )
   mask_estimator = tf.estimator.Estimator(
-    model_fn=mask_utils.mask_model_fn,
+    model_fn=model_fn,
     config=config,
     params=params,
     warm_start_from=model_checkpoint
   )
   bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
-  # mask_estimator.train(
-  #   input_fn = lambda: mask_input_fn(
-  #     FLAGS.data_volumes, 
-  #     FLAGS.label_volumes, 
-  #     fov_size, 
-  #     FLAGS.batch_size, 
-  #     FLAGS.image_mean, 
-  #     FLAGS.image_stddev),
-  #   steps=FLAGS.max_steps,
-  #   hooks=[bcast_hook])
   tensors_to_log = {
     "center": "center"
   }
   logging_hook = tf.train.LoggingTensorHook(
     tensors=tensors_to_log, every_n_iter=1
   )
+
+
+  # it=io_utils.predict_input_fn_v2(
+  #   data_volumes=FLAGS.data_volumes, 
+  #   chunk_shape=fov_size, 
+  #   label_shape=label_size,
+  #   overlap=overlap,
+  #   batch_size=FLAGS.batch_size, 
+  #   offset=FLAGS.image_mean, 
+  #   scale=FLAGS.image_stddev,
+  #   sub_bbox=FLAGS.bounding_box,
+  #   var_threshold=FLAGS.var_threshold)
+  
+  # with tf.Session() as sess:
+  #   for i in range(3):
+  #     res = sess.run(it)
+  #     print(res[0])
+      #print(res[0], res[1].shape, np.mean(res[1]))
+
+
+
+
   predictions = mask_estimator.predict(
-    input_fn=lambda: mask_utils.predict_input_fn(
+    input_fn=lambda: io_utils.predict_input_fn_v2(
       data_volumes=FLAGS.data_volumes, 
       chunk_shape=fov_size, 
+      label_shape=label_size,
       overlap=overlap,
       batch_size=FLAGS.batch_size, 
       offset=FLAGS.image_mean, 
       scale=FLAGS.image_stddev,
-      bounding_box=FLAGS.bounding_box,
+      sub_bbox=FLAGS.bounding_box,
       var_threshold=FLAGS.var_threshold),
     predict_keys=['center', 'logits', 'class_prediction'],
     hooks=[logging_hook, bcast_hook],
-    # checkpoint_path=FLAGS.model_checkpoint,
     yield_single_examples=True
   )
-  output_shapes = mask_utils.get_h5_shapes(FLAGS.data_volumes)
-  mask_utils.h5_sequential_chunk_writer(predictions,
+  output_shapes = io_utils.get_h5_shapes(FLAGS.data_volumes)
+  io_utils.h5_sequential_chunk_writer_v2(
+    predictions,
     output_volumes=FLAGS.output_volumes,
     output_shapes=output_shapes,
     num_classes=num_classes,
     chunk_shape=fov_size,
+    label_shape=label_size,
     overlap=overlap,
+    sub_bbox=FLAGS.bounding_box,
     mpi=FLAGS.mpi)
-
-  # f_w = h5py.File('')
-
-  # for i in results:
-  #   pass
-    # print(hvd.rank(), i['center'])
 
 
 if __name__ == '__main__':

@@ -15,7 +15,8 @@ from skimage.segmentation import find_boundaries
 from ffn.utils import bounding_box
 from ffn.training import inputs
 from ffn.training.import_util import import_symbol
-from ffn_mask import utils as mask_utils
+from ffn_mask import io_utils
+from ffn_mask import model_utils
 
 import horovod.tensorflow as hvd
 import sys
@@ -72,17 +73,19 @@ def main(unused_argv):
     label_size = fov_size
     model_args['label_size'] = label_size
   num_classes = int(model_args['num_classes'])
+
+  if num_classes == 1:
+    model_fn = model_utils.mask_model_fn_regression  
+  else:
+    model_fn = model_utils.mask_model_fn_classfication
+
   params = {
     'model_class': model_class,
     'model_args': model_args,
     'batch_size': FLAGS.batch_size,
     'num_classes': num_classes,
     'learning_rate': FLAGS.learning_rate
-
   }
-
-  logging.warn('training: %s', FLAGS.data_volumes)
-
 
   sess_config = tf.ConfigProto()
   sess_config.gpu_options.allow_growth = True
@@ -100,7 +103,7 @@ def main(unused_argv):
     keep_checkpoint_max=100,
   )
   mask_estimator = tf.estimator.Estimator(
-    model_fn=mask_utils.mask_model_fn_v2,
+    model_fn=model_fn,
     config=config,
     params=params
     )
@@ -112,16 +115,7 @@ def main(unused_argv):
      every_n_iter=100,
   )
   mask_estimator.train(
-    # input_fn = lambda: mask_utils.train_input_fn(
-    #   FLAGS.data_volumes, 
-    #   FLAGS.label_volumes, 
-    #   num_classes,
-    #   fov_size, 
-    #   label_size,
-    #   FLAGS.batch_size, 
-    #   FLAGS.image_mean, 
-    #   FLAGS.image_stddev),
-    input_fn = mask_utils.train_input_fn_v2(
+    input_fn = io_utils.train_input_fn(
       FLAGS.data_volumes, 
       FLAGS.label_volumes, 
       FLAGS.tf_coords,
