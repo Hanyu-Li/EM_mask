@@ -1,4 +1,5 @@
 import tensorflow as tf
+import tensorflow_addons as tfa
 import numpy as np
 import h5py
 import itertools
@@ -18,6 +19,7 @@ import horovod.tensorflow as hvd
 import mpi4py
 from mpi4py import MPI
 import cloudvolume
+tf.compat.v1.disable_eager_execution()
 comm = MPI.COMM_WORLD
 rank = comm.rank
 
@@ -85,9 +87,11 @@ def h5_random_chunk_generator(data_volumes, label_volumes, num_classes, chunk_sh
   return gen
 
 def parser(proto):
-  examples = tf.parse_single_example(proto, features=dict(
-      center=tf.FixedLenFeature(shape=[1, 3], dtype=tf.int64),
-      label_volume_name=tf.FixedLenFeature(shape=[1], dtype=tf.string),
+  examples = tf.io.parse_single_example(proto, features=dict(
+  # examples = tf.parse_single_example(proto, features=dict(
+      center=tf.io.FixedLenFeature(shape=[1, 3], dtype=tf.int64),
+      # center=tf.FixedLenFeature(shape=[1, 3], dtype=tf.int64),
+      label_volume_name=tf.io.FixedLenFeature(shape=[1], dtype=tf.string),
   ))
   coord = examples['center']
   volname = examples['label_volume_name']
@@ -427,12 +431,15 @@ def load_from_numpylike(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
     # starts = np.array(coord[0]) - (chunk_shape-1) // 2
     starts = np.array(coord[0]) - chunk_shape // 2
     slc = bounding_box.BoundingBox(start=starts, size=chunk_shape).to_slice()
+    # logging.warning('slices %s', slc)
     # slc is in z,y,x order
     # logging.warn('loading from %s %s, %s, %s', starts, chunk_shape, slc, volume.shape)
     if volume_axes == 'zyx':
       data = volume[slc[0], slc[1], slc[2], :]
     elif volume_axes == 'xyz':
       data = volume[slc[2], slc[1], slc[0], :]
+      data = data.transpose([2,1,0,3])
+      logging.warning('data shape %s', data.shape)
     else:
       raise ValueError('volume_axes mush either be "zyx" or "xyz"')
     # logging.warn('loaded data %s ', data.shape)
@@ -443,7 +450,7 @@ def load_from_numpylike(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
   num_classes = volume.shape[-1]
   logging.warn('weird class: %d %s', num_classes, volume.shape)
   with tf.name_scope('load_from_h5') as scope:
-    loaded = tf.py_func(
+    loaded = tf.compat.v1.py_func(
         _load_from_numpylike, [coord_tensor], [dtype],
         name=scope)[0]
     # logging.warn('before %s', loaded.shape)
@@ -523,8 +530,9 @@ def get_full_size(chunk_size, label_size):
 def random_rotate(coord, image, labels, chunk_shape, label_shape):
   angle = np.random.rand() * 2 * np.pi
   # with tf.device('/cpu:0'):
-  image = tf.contrib.image.rotate(image, angle, name='rot_im')
-  labels = tf.contrib.image.rotate(labels, angle, name='rot_lb')
+  # image = tf.contrib.image.rotate(image, angle, name='rot_im')
+  image = tfa.image.rotate(image, angle, name='rot_im')
+  labels = tfa.image.rotate(labels, angle, name='rot_lb')
   image_offset = np.array(image.shape.as_list())[1:3] // 2 - np.array(chunk_shape)[0:2] // 2
   label_offset = np.array(labels.shape.as_list())[1:3] // 2 - np.array(label_shape)[0:2] // 2
   # off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
@@ -533,6 +541,26 @@ def random_rotate(coord, image, labels, chunk_shape, label_shape):
   labels= tf.image.crop_to_bounding_box(labels, label_offset[0], label_offset[1], label_shape[0], label_shape[1])
   logging.warning('post offset shapes: %s %s', image.shape, labels.shape)
   return coord, image, labels
+
+def random_rotate_with_weights(coord, image, labels, weights, chunk_shape, label_shape):
+  angle = np.random.rand() * 2 * np.pi
+  # with tf.device('/cpu:0'):
+  # image = tf.contrib.image.rotate(image, angle, name='rot_im')
+  image = tfa.image.rotate(image, angle, name='rot_im')
+  labels = tfa.image.rotate(labels, angle, name='rot_lb')
+  weights = tfa.image.rotate(weights, angle, name='rot_im')
+
+  image_offset = np.array(image.shape.as_list())[1:3] // 2 - np.array(chunk_shape)[0:2] // 2
+  label_offset = np.array(labels.shape.as_list())[1:3] // 2 - np.array(label_shape)[0:2] // 2
+  # weights_offset = np.array(weights.shape.as_list())[1:3] // 2 - np.array(chunk_shape)[0:2] // 2
+
+  # off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
+  logging.warning('offsets: %s %s', image_offset, label_offset)
+  image= tf.image.crop_to_bounding_box(image, image_offset[0], image_offset[1], chunk_shape[0], chunk_shape[1])
+  labels= tf.image.crop_to_bounding_box(labels, label_offset[0], label_offset[1], label_shape[0], label_shape[1])
+  weights = tf.image.crop_to_bounding_box(weights, image_offset[0], image_offset[1], chunk_shape[0], chunk_shape[1])
+  logging.warning('post offset shapes: %s %s %s', image.shape, labels.shape, weights.shape)
+  return coord, image, labels, weights
 
 def train_input_fn(data_volumes, 
                    label_volumes, 
@@ -569,7 +597,10 @@ def train_input_fn(data_volumes,
       logging.warning('pre rotation shapes: %s %s', pre_chunk_shape, pre_label_shape)
 
       max_shape = image_volume_map[key].shape
-      label_scale = 1.0 if num_classes > 1 else 2.0 # convert 0-1 to -0.5, 0.5 for regression model
+      # label_scale = 1.0 if num_classes > 1 else 2.0 # convert 0-1 to -0.5, 0.5 for regression model
+      # label_offset = 0.0 # convert 0-1 to -0.5, 0.5 for regression model
+
+      label_scale = 1.0 # convert 0-1 to -0.5, 0.5 for regression model
       label_offset = 0.0 if num_classes > 1 else -0.5 # convert 0-1 to -0.5, 0.5 for regression model
 
       # fnames = tf.matching_files(tf_coords+'*')
@@ -578,9 +609,9 @@ def train_input_fn(data_volumes,
 
       files = tf.data.Dataset.list_files(tf_coords+'*')
       # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'))
-      # files = files.shard(hvd.size(), hvd.rank())
-      files = files.apply(
-        tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
+      files = files.shard(hvd.size(), hvd.rank())
+      # files = files.apply(
+      #   tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
       ds = files.apply(
         tf.data.experimental.parallel_interleave(
           lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
@@ -619,6 +650,105 @@ def train_input_fn(data_volumes,
       return ds
   return h5_coord_chunk_dataset
 
+def train_input_fn_with_weight(
+  data_volumes, 
+  label_volumes, 
+  weight_volumes,
+  tf_coords,
+  num_classes, 
+  chunk_shape, 
+  label_shape, 
+  batch_size, 
+  offset, 
+  scale,
+  rotation=False):
+  def h5_coord_chunk_dataset():
+    image_volume_map = {}
+    for vol in data_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+
+    label_volume_map = {}
+    for vol in label_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      if num_classes > 1:
+        label_volume_map[volname] = tf.keras.utils.to_categorical(
+          h5py.File(path, 'r')[dataset])
+      else:
+        label_volume_map[volname] = np.expand_dims(h5py.File(path, 'r')[dataset], axis=-1)
+        
+    weight_volume_map = {}
+    for vol in weight_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      weight_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+        
+
+    for key in image_volume_map: # Currently only works with one key in the map
+      if rotation:
+        pre_chunk_shape, pre_label_shape = get_full_size(chunk_shape, label_shape)
+      else:
+        pre_chunk_shape, pre_label_shape = chunk_shape, label_shape
+
+      logging.warning('pre rotation shapes: %s %s', pre_chunk_shape, pre_label_shape)
+
+      max_shape = image_volume_map[key].shape
+      # label_scale = 1.0 if num_classes > 1 else 2.0 # convert 0-1 to -0.5, 0.5 for regression model
+      # label_offset = 0.0 # convert 0-1 to -0.5, 0.5 for regression model
+
+      label_scale = 1.0 # convert 0-1 to -0.5, 0.5 for regression model
+      label_offset = 0.0 if num_classes > 1 else -0.5 # convert 0-1 to -0.5, 0.5 for regression model
+
+      # fnames = tf.matching_files(tf_coords+'*')
+      # logging.info('fnames %s', fnames)
+      # ds = tf.data.TFRecordDataset(fnames, compression_type='GZIP')
+
+      files = tf.data.Dataset.list_files(tf_coords+'*')
+      # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'))
+      files = files.shard(hvd.size(), hvd.rank())
+      # files = files.apply(
+      #   tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
+      ds = files.apply(
+        tf.data.experimental.parallel_interleave(
+          lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
+          cycle_length=2
+        )
+      )
+      # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'), cycle_length=2)
+      ds = ds.repeat().shuffle(8000)
+      ds = ds.map(parser, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      # ds = ds.filter(lambda coord, volname: filter_out_of_bounds(coord, chunk_shape, max_shape))
+      ds = ds.map(lambda coord, volname: (
+          coord, 
+          load_from_numpylike(coord, image_volume_map[key], pre_chunk_shape), 
+          load_from_numpylike(coord, label_volume_map[key], pre_label_shape),
+          load_from_numpylike(coord, weight_volume_map[key], pre_chunk_shape),
+          ), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.map(lambda coord, image, label, weights: (
+          coord, 
+          preprocess_image(image, offset, scale),
+          tf.cast(label, tf.float32) * label_scale + label_offset,
+          weights
+          ), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      if rotation:
+        ds = ds.map(lambda coord, image, label, weights: random_rotate_with_weights(
+          coord, image, label, weights, chunk_shape, label_shape), 
+          num_parallel_calls=tf.data.experimental.AUTOTUNE)         
+      ds = ds.map(lambda coord, image, label, weights: (
+        {
+        'center': coord[0],
+        'image': image,
+        'weights': weights
+        },
+        label),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.batch(batch_size, drop_remainder=True)
+      ds = ds.prefetch(1)
+      logging.warn('ds_shape: %d, %s', batch_size, ds)
+      return ds
+
+  return h5_coord_chunk_dataset
 
 def predict_input_fn(data_volumes, chunk_shape, 
   overlap, batch_size, offset, scale, bounding_box, var_threshold):
@@ -786,98 +916,6 @@ def predict_input_fn_h5(input_volume,
   ds = ds.batch(batch_size)
   return ds
 
-def predict_input_fn_precomputed(
-  input_volume,
-  input_offset,
-  input_size,
-  chunk_shape,
-  label_shape,
-  overlap,
-  batch_size,
-  offset,
-  scale,
-  var_threshold):
-
-  if input_offset is None or input_size is None:
-  #   full_input = cloudvolume.CloudVolume('file://%s' % input_volume, mip=0, parallel=True, progress=False)
-  #   slc = np.s_[
-  #     input_offset[0]:input_offset[0]+input_size[0],
-  #     input_offset[1]:input_offset[1]+input_size[1],
-  #     input_offset[2]:input_offset[2]+input_size[2],
-  #     :
-  #     ]
-  #   data = np.transpose(full_input[slc], [2,1,0,3])
-
-  # else:
-    # in x, y, z
-    full_input = cloudvolume.CloudVolume('file://%s' % input_volume, mip=0, parallel=True, progress=False)
-    input_offset = (0, 0, 0)
-    input_size = full_input.shape()
-  slc = np.s_[
-    input_offset[0]:input_offset[0]+input_size[0],
-    input_offset[1]:input_offset[1]+input_size[1],
-    input_offset[2]:input_offset[2]+input_size[2],
-    :
-    ]
-  logging.warn('shapes: %s %s', start, size)
-  # data = full_input[slc]
-  data = np.transpose(full_input[slc], [2,1,0,3])
-  # bbox = bounding_box.BoundingBox(start=start, size=size[::-1])
-  logging.warning('input_shape %s', data.shape)
-                    
-  # offset_xyz = np.array(offset_xyz)
-  # size_xyz = np.array(size_xyz)
-  # bbox = cloudvolume.Bbox(offset_xyz, offset_xyz + size_xyz) 
-
-  # logging.warning('bbox: %s', bbox)
-
-  # in/out shape discrepency due to size shrinking after conv pool layers
-  in_out_diff = (np.array(chunk_shape) - np.array(label_shape)) // 2
-  overlap_padded = overlap + in_out_diff
-
-  # image_volume_map = {}
-  # for vol in data_volumes.split(','):
-  #   volname, path, dataset = vol.split(':')
-  #   image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
-  # assume only one volname key in inference
-
-  bbox = bounding_box.BoundingBox(start=[0,0,0], size=input_size)
-  logging.warn('global bbox: %s', bbox)
-  def h5_sequential_bbox_gen():
-    calc = bounding_box.OrderlyOverlappingCalculator(
-      outer_box=bbox, 
-      sub_box_size=chunk_shape, 
-      overlap=overlap_padded, 
-      include_small_sub_boxes=True,
-      back_shift_small_sub_boxes=True)
-    for bb in calc.generate_sub_boxes():
-      yield [bb.start + bb.size // 2] # central coord which is io'ed
-
-  ds = tf.data.Dataset.from_generator(
-    generator=h5_sequential_bbox_gen, 
-    output_types=(tf.int64), 
-    output_shapes=(tf.TensorShape((1,3)))
-  )
-  ds = ds.apply(
-    tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
-  ds = ds.map(lambda coord: (
-      coord, 
-      load_from_numpylike(coord, data, chunk_shape)),
-     num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
-     num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  # )
-    # num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  ds = ds.map(lambda coord, image:
-    {
-      'center': coord,
-      'image': image
-    },
-    num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  ds = ds.batch(batch_size)
-  return ds
-
-
 
 def crop_v2(tensor, crop_shape, offset=(0, 0, 0), batched=False):
   """Extracts 'crop_shape' around 'offset' from 'tensor'.
@@ -964,3 +1002,10 @@ def crop_v3(tensor, crop_shape, offset=(0, 0, 0), batched=False):
       tensor = tf.squeeze(tensor, axis=0)
 
     return tensor
+
+# 2D image utils 
+def generate_train_valid_dataset(
+  train_set,
+  valid_set,
+):
+  pass

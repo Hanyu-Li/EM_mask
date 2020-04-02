@@ -242,7 +242,8 @@ def conv_relu_keras(filters, filter_size, padding='same', name=None):
       padding=padding, 
       # activation=tf.keras.activations.relu, 
       activation='relu', 
-      kernel_regularizer=tf.keras.regularizers.l2(0.01),
+      kernel_initializer='he_normal',
+      # kernel_regularizer=tf.keras.regularizers.l2(0.01),
       name=name+'_conv')(inputs)
     # conv = tf.keras.layers.BatchNormalization(name=name+'_bn')(conv)
     # conv = tf.keras.layers.ReLU(name=name+'_relu')(conv)
@@ -616,7 +617,7 @@ def unet_dtu_2_pad_concat(patches, num_classes):
   https://link.springer.com/content/pdf/10.1007%2F978-3-030-00934-2_36.pdf
   no crop or pad, assuming patch shape has dimensions of powers of 2
   '''
-  with tf.variable_scope('unet'):
+  with tf.compat.v1.variable_scope('unet'):
     conv = tf.keras.layers.Conv3D
     upconv = tf.keras.layers.Conv3DTranspose
     pool = tf.keras.layers.MaxPool3D
@@ -640,22 +641,22 @@ def unet_dtu_2_pad_concat(patches, num_classes):
     # conv4 = conv(2592, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
     # conv4 = conv(2592, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
 
-    with tf.variable_scope('block_1'):
+    with tf.compat.v1.variable_scope('block_1'):
       conv1 = conv_relu_keras(12, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
       conv1 = conv_relu_keras(12, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
       pool1 = pool((1, 3, 3), name='pool_1')(conv1)
 
-    with tf.variable_scope('block_2'):
+    with tf.compat.v1.variable_scope('block_2'):
       conv2 = conv_relu_keras(72, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
       conv2 = conv_relu_keras(72, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
       pool2 = pool((1, 3, 3), name='pool_2')(conv2)
 
-    with tf.variable_scope('block_3'):
+    with tf.compat.v1.variable_scope('block_3'):
       conv3 = conv_relu_keras(432, (3, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
       conv3 = conv_relu_keras(432, (3, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
       pool3 = pool((3, 3, 3), name='pool_3')(conv3)
 
-    with tf.variable_scope('block_4'):
+    with tf.compat.v1.variable_scope('block_4'):
       conv4 = conv_relu_keras(2592, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
       conv4 = conv_relu_keras(2592, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
     logging.warn('conv1: %s', conv1.shape)
@@ -663,19 +664,19 @@ def unet_dtu_2_pad_concat(patches, num_classes):
     logging.warn('conv3: %s', conv3.shape)
     logging.warn('conv4: %s', conv4.shape)
 
-    with tf.variable_scope('block_5'):
+    with tf.compat.v1.variable_scope('block_5'):
       upconv5 = upconv(432, (3, 3, 3), strides=(3, 3, 3), activation='relu', padding=padding_mode, name='upconv_5')(conv4)
       # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
       concat5 = pad_concat(conv3, upconv5, name='concat_5')
       conv5 = conv_relu_keras(432, (3, 3, 3), padding=padding_mode, name='conv_5')(concat5)
 
-    with tf.variable_scope('block_6'):
+    with tf.compat.v1.variable_scope('block_6'):
       upconv6 = upconv(72, (1, 3, 3), strides=(1, 3, 3), activation='relu', padding=padding_mode, name='upconv_6')(conv5)
       # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
       concat6 = pad_concat(conv2, upconv6, name='concat_6')
       conv6 = conv_relu_keras(72, (1, 3, 3), padding=padding_mode, name='conv_6')(concat6)
 
-    with tf.variable_scope('block_7'):
+    with tf.compat.v1.variable_scope('block_7'):
       upconv7 = upconv(12, (1, 3, 3), strides=(1, 3, 3), activation='relu', padding=padding_mode, name='upconv_7')(conv6)
       # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
       concat7 = pad_concat(conv1, upconv7, name='concat_7')
@@ -712,3 +713,450 @@ def conv_pool_model(patches, num_classes):
   outputs = conv(num_classes, 1, name='conv_6', padding='valid')(conv4)
   print('>>>', outputs.shape)
   return outputs
+
+
+def shallow_z_unet(patches, num_classes):
+  """Unet for 3D patches with small z dimension.
+
+  Args:
+    patches: (b, z, y, x, c) inputs
+    num_classes: output channels
+  Returns:
+    output tensor
+  """
+  with tf.compat.v1.variable_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    conv1 = conv_bn_relu_keras(32, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+
+    conv3 = conv_bn_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((1, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_bn_relu_keras(512, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    upconv5 = upconv(512, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_5')(conv4)
+    # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
+    concat5 = crop_concat(conv3, upconv5, name='concat_5')
+    conv5 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5a')(concat5)
+    conv5 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+
+    upconv6 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
+    concat6 = crop_concat(conv2, upconv6, name='concat_6')
+    conv6 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
+    concat7 = crop_concat(conv1, upconv7, name='concat_7')
+    conv7 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    # output = conv_bn_relu_keras(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+    # conv8 = conv()
+    conv8 = conv(num_classes, (1, 1, 1), padding='valid', name='conv_8')(conv7)
+    output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', output.shape)
+    return output
+
+def shallow_z_unet_v2(patches, num_classes):
+  """Unet for 3D patches with small z dimension.
+
+  Args:
+    patches: (b, z, y, x, c) inputs
+    num_classes: output channels
+  Returns:
+    output tensor
+  """
+  with tf.compat.v1.variable_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    conv1 = conv_bn_relu_keras(32, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+
+    conv3 = conv_bn_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((5, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_bn_relu_keras(512, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    upconv5 = upconv(512, (1, 2, 2), strides=(5, 2, 2), padding=padding_mode, name='upconv_5')(conv4)
+    # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
+    concat5 = crop_concat(conv3, upconv5, name='concat_5')
+    conv5 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5a')(concat5)
+    conv5 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+
+    upconv6 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
+    concat6 = crop_concat(conv2, upconv6, name='concat_6')
+    conv6 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
+    concat7 = crop_concat(conv1, upconv7, name='concat_7')
+    conv7 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    # output = conv_bn_relu_keras(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+    # conv8 = conv()
+    conv8 = conv(num_classes, (1, 1, 1), padding='valid', name='conv_8')(conv7)
+    output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', output.shape)
+    return output
+
+def shallow_z_unet_v3(patches, num_classes):
+  """Unet for 3D patches with small z dimension.
+
+  Args:
+    patches: (b, z, y, x, c) inputs
+    num_classes: output channels
+  Returns:
+    output tensor
+  """
+  with tf.compat.v1.variable_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    conv1 = conv_bn_relu_keras(32, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+
+    conv3 = conv_bn_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((5, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_bn_relu_keras(512, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    upconv5 = upconv(512, (1, 2, 2), strides=(5, 2, 2), padding=padding_mode, name='upconv_5')(conv4)
+    # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
+    concat5 = crop_concat(conv3, upconv5, name='concat_5')
+    conv5 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5a')(concat5)
+    conv5 = conv_bn_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+
+    upconv6 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
+    concat6 = crop_concat(conv2, upconv6, name='concat_6')
+    conv6 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_bn_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
+    concat7 = crop_concat(conv1, upconv7, name='concat_7')
+    conv7 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_bn_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    # output = conv_bn_relu_keras(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+    # conv8 = conv()
+    conv8 = conv(num_classes, (1, 1, 1), padding='valid', name='conv_8')(conv7)
+    output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', output.shape)
+    return output
+
+def shallow_z_unet_v4(patches, num_classes):
+  """Unet for 3D patches with small z dimension.
+
+  Args:
+    patches: (b, z, y, x, c) inputs
+    num_classes: output channels
+  Returns:
+    output tensor
+  """
+  with tf.compat.v1.variable_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    conv1 = conv_relu_keras(32, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+
+    conv3 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((1, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_relu_keras(512, (1, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    upconv5 = upconv(512, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_5')(conv4)
+    # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
+    concat5 = crop_concat(conv3, upconv5, name='concat_5')
+    conv5 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_5a')(concat5)
+    conv5 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+
+    upconv6 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
+    concat6 = crop_concat(conv2, upconv6, name='concat_6')
+    conv6 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
+    concat7 = crop_concat(conv1, upconv7, name='concat_7')
+    conv7 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    # output = conv_bn_relu_keras(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+    # conv8 = conv()
+    conv8 = conv(num_classes, (1, 1, 1), padding='valid', name='conv_8')(conv7)
+    output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', output.shape)
+    return output
+
+def shallow_z_unet_v5(patches, num_classes):
+  """Unet for 3D patches with small z dimension.
+
+  Args:
+    patches: (b, z, y, x, c) inputs
+    num_classes: output channels
+  Returns:
+    output tensor
+  """
+  with tf.compat.v1.variable_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    conv1 = conv_relu_keras(32, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_relu_keras(64, (3, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+
+    conv3 = conv_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((1, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_relu_keras(512, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    upconv5 = upconv(512, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_5')(conv4)
+    # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
+    concat5 = crop_concat(conv3, upconv5, name='concat_5')
+    conv5 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5a')(concat5)
+    conv5 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+
+    upconv6 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
+    concat6 = crop_concat(conv2, upconv6, name='concat_6')
+    conv6 = conv_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
+    concat7 = crop_concat(conv1, upconv7, name='concat_7')
+    conv7 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    # output = conv_bn_relu_keras(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+    # conv8 = conv()
+    conv8 = conv(num_classes, (1, 1, 1), padding='valid', name='conv_8')(conv7)
+    output = conv8[:, 2:3, :, :, :]
+    # output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', output.shape)
+    return output
+
+def tissue_model(patches, num_classes):
+  with tf.compat.v1.variable_scope('tissue_model'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'valid'
+
+    conv1 = conv(64, (1, 3, 3), padding=padding_mode, name='conv_1')(patches)
+    pool1 = pool((1, 2, 2), strides=(1, 2, 2), name='pool_1')(conv1)
+
+    conv2 = conv(64, (1, 3, 3), padding=padding_mode, name='conv_2')(pool1)
+    pool2 = pool((1, 2, 2), strides=(1, 2, 2), name='pool_2')(conv2)
+
+    conv3 = conv(64, (1, 3, 3), padding=padding_mode, name='conv_3')(pool2)
+    pool3 = pool((1, 2, 2), strides=(1, 2, 2), name='pool_3')(conv3)
+
+    conv4 = conv(16, (1, 3, 3), padding=padding_mode, name='conv_4')(pool3)
+
+    conv5 = conv(512, (1, 1, 1), padding=padding_mode, name='conv_5')(conv4)
+
+    output = conv(num_classes, (1, 1, 1), padding='valid', name='conv_6')(conv5)
+
+    logging.warn('conv1: %s', conv1.shape)
+    logging.warn('pool1: %s', pool1.shape)
+    logging.warn('conv2: %s', conv2.shape)
+    logging.warn('conv3: %s', conv3.shape)
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', output.shape)
+
+
+    # output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    return output
+  
+def pseudo_2d_unet(patches, num_classes):
+  with tf.compat.v1.variable_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    conv1 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+
+    conv3 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((1, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_relu_keras(512, (1, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_relu_keras(512, (1, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    pool4 = pool((1, 2, 2), name='pool_4')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    conv5 = conv_relu_keras(1024, (1, 3, 3), padding=padding_mode, name='conv_5a')(pool4)
+    conv5 = conv_relu_keras(1024, (1, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+    logging.warn('conv5: %s', conv5.shape)
+
+
+    upconv6 = upconv(512, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    concat6 = crop_concat(conv4, upconv6, name='concat_6')
+    conv6 = conv_relu_keras(512, (1, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_relu_keras(512, (1, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    concat7 = crop_concat(conv3, upconv7, name='concat_7')
+    conv7 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_relu_keras(256, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    upconv8 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_8')(conv7)
+    concat8 = crop_concat(conv2, upconv8, name='concat_8')
+    conv8 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_8a')(concat8)
+    conv8 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_8b')(conv8)
+
+    upconv9 = upconv(64, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_9')(conv8)
+    concat9 = crop_concat(conv1, upconv9, name='concat_9')
+    conv9 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_9a')(concat9)
+    conv9 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_9b')(conv9)
+    conv9 = conv_relu_keras(2, (1, 3, 3), padding='same', name='conv_9c')(conv9)
+    output = conv(num_classes, (1, 1, 1), padding='same', name='conv_9d')(conv9)
+    # output = tf.math.reduce_mean(conv8, axis=1, keepdims=True, name='mean9')
+    # output = conv(num_classes, (5, 1, 1), padding='valid', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', conv8.shape)
+    logging.warn('conv9: %s', conv9.shape)
+    logging.warn('output: %s', output.shape)
+    return output

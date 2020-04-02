@@ -13,10 +13,11 @@ import numpy as np
 import itertools
 from skimage.segmentation import find_boundaries
 from ffn.utils import bounding_box
+from ffn.utils import geom_utils
 from ffn.training import inputs
 from ffn.training.import_util import import_symbol
 # from ffn_mask import io_utils, model_utils
-from ffn_mask import precomputed_utils, model_utils
+from ffn_mask import h5_utils, model_utils
 
 
 # import horovod.tensorflow as hvd
@@ -37,8 +38,6 @@ flags.DEFINE_string('input_offset', '',
                     'offset x,y,z')
 flags.DEFINE_string('input_size', '',
                     'size x,y,z')
-flags.DEFINE_integer('input_mip', 0,
-                    'mip level to read from cloudvolume')
 flags.DEFINE_string('output_volume', None, '')
 flags.DEFINE_string('model_checkpoint', None, '')  
 flags.DEFINE_string('model_name', None,
@@ -61,13 +60,19 @@ flags.DEFINE_list('use_gpu', [], '')
 
 def prepare_model(model_params, model_checkpoint, use_gpu=[]):
   if not len(use_gpu):
-    sess_config = tf.ConfigProto(
+    sess_config = tf.compat.v1.ConfigProto(
       device_count={'GPU': 0}
     )
   else:
+    # gpus = tf.config.experimental.list_physical_devices('GPU')
+    # for gpu in gpus:
+    #     tf.config.experimental.set_memory_growth(gpu, True)
+    # if gpus:
+    #     tf.config.experimental.set_visible_devices(gpus[mpi_rank], 'GPU')
+    # logging.warning('phys gpus: %s', gpus)
     rank_gpu = str(mpi_rank % len(use_gpu))
-    gpu_options = tf.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
-    sess_config = tf.ConfigProto(
+    gpu_options = tf.compat.v1.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
+    sess_config = tf.compat.v1.ConfigProto(
       gpu_options=gpu_options
     )
 
@@ -91,10 +96,8 @@ def prepare_model(model_params, model_checkpoint, use_gpu=[]):
     params=model_params,
     warm_start_from=model_checkpoint
   )
-  # bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
 
   return mask_estimator
-
 
 
 def main(unused_argv):
@@ -109,14 +112,17 @@ def main(unused_argv):
   else:
     # input_offset = None
     # input_size = None
-    input_offset, input_size = precomputed_utils.get_offset_and_size(FLAGS.input_volume)
+    input_offset = [0, 0, 0]
+    input_size = h5_utils.get_h5_shape(FLAGS.input_volume)[::-1]
+
+    # input_offset, input_size = precomputed_utils.get_offset_and_size(FLAGS.input_volume)
 
   if 'label_size' in model_args:
     label_size = tuple([int(i) for i in model_args['label_size']])
   else:
     label_size = fov_size
     model_args['label_size'] = label_size
-  input_mip = FLAGS.input_mip
+  # input_mip = FLAGS.input_mip
   overlap = [int(i) for i in FLAGS.overlap]
   num_classes = int(model_args['num_classes'])
   params = {
@@ -134,16 +140,15 @@ def main(unused_argv):
   tensors_to_log = {
     "center": "center"
   }
-  logging_hook = tf.train.LoggingTensorHook(
+  logging_hook = tf.compat.v1.train.LoggingTensorHook(
     tensors=tensors_to_log, every_n_iter=1
   )
 
   predictions = mask_estimator.predict(
-    input_fn=lambda: precomputed_utils.predict_input_fn_precomputed(
+    input_fn=lambda: h5_utils.predict_input_fn_h5_v2(
       input_volume=FLAGS.input_volume, 
       input_offset=input_offset,
       input_size=input_size,
-      input_mip=input_mip,
       chunk_shape=fov_size, 
       label_shape=label_size,
       overlap=overlap,
@@ -156,28 +161,12 @@ def main(unused_argv):
     hooks = [],
     yield_single_examples=False
   )
-  # for i, p in enumerate(predictions):
-  #   logging.warning('rank %d block %d', mpi_rank, i)
-  #   logging.warning('summaries: %s', p['class_prediction'].shape)
-  # # output_shapes = io_utils.get_h5_shapes(FLAGS.data_volumes)
-  # # output_shapes = io_utils.get_h5_shapes(FLAGS.data_volumes)
-  # output_shapes = {FLAGS.output_volumes.split(':')[0]: input_size[::-1]}
-  # io_utils.h5_sequential_chunk_writer_v2(
-  #   predictions,
-  #   output_volumes=FLAGS.output_volumes,
-  #   output_shapes=output_shapes,
-  #   num_classes=num_classes,
-  #   chunk_shape=fov_size,
-  #   label_shape=label_size,
-  #   overlap=overlap,
-  #   sub_bbox=FLAGS.bounding_box,
-  #   mpi=FLAGS.mpi)
 
-  _ = precomputed_utils.writer(
+  _ = h5_utils.h5_mpi_writer(
     predictions,
     output_volume=FLAGS.output_volume,
-    output_offset=input_offset,
     output_size=input_size,
+    num_classes=num_classes,
     chunk_shape=fov_size,
     label_shape=label_size,
     overlap=overlap
