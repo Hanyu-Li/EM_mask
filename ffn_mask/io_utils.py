@@ -609,7 +609,8 @@ def train_input_fn(data_volumes,
 
       files = tf.data.Dataset.list_files(tf_coords+'*')
       # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'))
-      files = files.shard(hvd.size(), hvd.rank())
+      # files = files.shard(hvd.size(), hvd.rank())
+      files = files.shuffle(100)
       # files = files.apply(
       #   tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
       ds = files.apply(
@@ -619,6 +620,7 @@ def train_input_fn(data_volumes,
         )
       )
       # ds = files.interleave(lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'), cycle_length=2)
+      ds = ds.shard(hvd.size(), hvd.rank())
       ds = ds.repeat().shuffle(8000)
       ds = ds.map(parser, num_parallel_calls=tf.data.experimental.AUTOTUNE)
       # ds = ds.filter(lambda coord, volname: filter_out_of_bounds(coord, chunk_shape, max_shape))
