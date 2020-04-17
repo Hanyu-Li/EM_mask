@@ -65,6 +65,12 @@ def load_from_h5(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
     # loaded.set_shape(list(chunk_shape[::]) + [num_classes])
     # logging.warn('after %s', loaded.shape)
     return loaded
+def get_num_of_bbox(input_offset, input_size, chunk_shape, overlap):
+  union_bbox = bounding_box.BoundingBox(start=input_offset, size=input_size)
+  sub_bboxes = get_bboxes(union_bbox, chunk_size=chunk_shape, 
+    overlap=overlap, back_shift_small=True, backend='ffn')
+  return len(sub_bboxes)
+
 def predict_input_fn_h5_v2(
   input_volume,
   input_offset, 
@@ -81,7 +87,6 @@ def predict_input_fn_h5_v2(
   For incoming h5 volume, break down into sub bboxes, and use subsets according
   to mpi rank
   """
-
   volname, path, dataset = input_volume.split(':')
   if input_offset is None or input_size is None:
     with h5py.File(path, 'r') as f:
@@ -120,7 +125,7 @@ def predict_input_fn_h5_v2(
   logging.warning('bbox %s %s', ranked_sub_bboxes[0].start, ranked_sub_bboxes[0].end)
   def sub_bbox_iterator():
     for sb in ranked_sub_bboxes:
-      logging.warning('load bbox %s', (sb.start + sb.end) // 2)
+      # logging.warning('load bbox %s', (sb.start + sb.end) // 2)
       yield [(sb.start + sb.end) // 2]
   # in_out_diff = (np.array(chunk_shape) - np.array(label_shape)) // 2
   # overlap_padded = overlap + in_out_diff
@@ -135,9 +140,9 @@ def predict_input_fn_h5_v2(
   ds = ds.map(lambda coord: (
       coord, 
       load_from_h5(coord, data, chunk_shape)),
-     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
-     num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    num_parallel_calls=tf.data.experimental.AUTOTUNE)
   # )
     # num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.map(lambda coord, image:
@@ -155,14 +160,14 @@ def get_h5_shape(data_volume):
 
 def h5_mpi_writer(
   prediction_generator,
-  output_volume, 
+  output_volume,
   output_size,
   num_classes,
   output_offset=(0, 0, 0),
   chunk_shape=(32, 64, 64),
   label_shape=(32, 64, 64),
   overlap=(0, 0, 0),
-  sub_bbox=None,
+  num_iter=None,
   axes='zyx',
   mpi=True):
   '''Sequentially write chunks(with overlap) from volumes'''
@@ -201,15 +206,15 @@ def h5_mpi_writer(
   zyx_overlap = overlap[::-1]
   logging.warning('write_size %s', write_size)
   # for p in tqdm(prediction_generator, total=3080):
-  for p in prediction_generator:
+  for p in tqdm(prediction_generator, total=num_iter):
     # center, logits, class_prediction = p['center'], p['logits'], p['class_prediction']
     # logging.warn('pred shape %s %s', center, class_prediction.shape)
     # logging.warn('pred result: %s', np.mean(logits[:]))
     # logging.warn('pred %s %s %s', center, logits.shape, np.mean(logits[:]))
     for center, logits, class_prediction in zip(p['center'], p['logits'], p['class_prediction']):
     # for center, logits, class_prediction in zip(p['center'], p['logits'], p['class_prediction']):
-      logging.warn('pred %s %s %s', center, logits.shape, np.mean(logits[:]))
-      zyx_center = center[0][::-1]
+      # logging.warn('pred %s %s %s', center, logits.shape, np.mean(logits[:]))
+      zyx_center = center[0][::-1] - output_offset[::-1]
       zyx_write_size = write_size[::-1]
 
       zyx_start = zyx_center - zyx_write_size // 2
@@ -225,10 +230,20 @@ def h5_mpi_writer(
         zyx_overlap[1] // 2: zyx_overlap[1] // 2 + zyx_write_size[1],
         zyx_overlap[2] // 2: zyx_overlap[2] // 2 + zyx_write_size[2],
       ]
-      logging.warning('write slc %s read slc %s', w_slc, r_slc)
-      logging.warning('pred_center %s, write_center %s', center, zyx_start + zyx_write_size // 2)
-      logging.warning('overlap %s', zyx_overlap)
-      logging.warning('writing shape: %s', logits[r_slc].shape)
+      # logging.warning('write slc %s read slc %s', w_slc, r_slc)
+      # logging.warning('pred_center %s, write_center %s', center, zyx_start + zyx_write_size // 2)
+      # logging.warning('overlap %s', zyx_overlap)
+      # logging.warning('writing shape: %s', logits[r_slc].shape)
+
+      # w_size = w_slc[0].stop - w_slc[0].start
+      # if 
+
+
+
+      # try:
+      # logging.warning('wr shapes: %s, %s, %s', 
+      #   logits_ds[w_slc].shape, logits[r_slc].shape)
+      assert logits_ds[w_slc].shape == logits[r_slc].shape
       logits_ds[w_slc] = np.array(logits[r_slc])
       class_prediction_ds[w_slc] = class_prediction[r_slc]
   f.close()

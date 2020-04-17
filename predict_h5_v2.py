@@ -131,6 +131,14 @@ def main(unused_argv):
     'batch_size': FLAGS.batch_size,
     'num_classes': num_classes
   }
+
+  # larger output shape to allow some border padding
+  output_size = np.array(input_size) + np.array(fov_size) // 2
+  # if mpi_rank == 0:
+  num_bbox = h5_utils.get_num_of_bbox(input_offset, input_size, fov_size, overlap)
+  # else:
+  #   num_bbox = None
+  
   
   # print('gpu', FLAGS.use_gpu)
   # if len(FLAGS.use_gpu):
@@ -167,9 +175,11 @@ def main(unused_argv):
     output_volume=FLAGS.output_volume,
     output_size=input_size,
     num_classes=num_classes,
+    output_offset=input_offset,
     chunk_shape=fov_size,
     label_shape=label_size,
-    overlap=overlap
+    overlap=overlap,
+    num_iter=num_bbox // mpi_size // FLAGS.batch_size
   )
 
 if __name__ == '__main__':
