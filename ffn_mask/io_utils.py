@@ -1,5 +1,9 @@
+from packaging import version
 import tensorflow as tf
-import tensorflow_addons as tfa
+if version.parse(tf.__version__) < version.parse('2.0.0'):
+  tfa = tf.contrib
+else:
+  import tensorflow_addons as tfa
 import numpy as np
 import h5py
 import itertools
