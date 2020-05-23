@@ -1,4 +1,4 @@
-'''Script for training a mask classification model.'''
+'''Merge hotspot detection model training.'''
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -7,57 +7,32 @@ from absl import app
 from absl import flags
 from absl import logging
 
-import os
-import h5py
-import horovod.tensorflow as hvd
-# hvd.init()
-# os.environ['CUDA_VISIBLE_DEVICES'] = str(hvd.local_rank())
-import tensorflow as tf
-tf.compat.v1.disable_eager_execution()
 import numpy as np
-import itertools
-# from skimage.segmentation import find_boundaries
-# from ffn.utils import bounding_box
-# from ffn.training import inputs
+import cloudvolume
+# import tensorflow as tf
+
+from ffn_mask.merge_utils import *
+tf.compat.v1.disable_eager_execution()
+
+import horovod.tensorflow as hvd
 from ffn.training.import_util import import_symbol
 from ffn_mask import io_utils
 from ffn_mask import model_utils
 
-import sys
-from mpi4py import MPI
 import json
-
-# tf.disable_v2_behavior()
-
-comm = MPI.COMM_WORLD
-rank = comm.rank
-
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('data_volumes', None,
+flags.DEFINE_string('segmentation_vol', None,
                     'Comma-separated list of <volume_name>:<volume_path>:'
                     '<dataset>, where volume_name need to match the '
                     '"label_volume_name" field in the input example, '
                     'volume_path points to HDF5 volumes containing uint8 '
                     'image data, and `dataset` is the name of the dataset '
                     'from which data will be read.')
-flags.DEFINE_string('label_volumes', None,
-                    'Comma-separated list of <volume_name>:<volume_path>:'
-                    '<dataset>, where volume_name need to match the '
-                    '"label_volume_name" field in the input example, '
-                    'volume_path points to HDF5 volumes containing int64 '
-                    'label data, and `dataset` is the name of the dataset '
-                    'from which data will be read.')
-flags.DEFINE_string('weights_volumes', None,
-                    'Comma-separated list of <volume_name>:<volume_path>:'
-                    '<dataset>, where volume_name need to match the '
-                    '"label_volume_name" field in the input example, '
-                    'volume_path points to HDF5 volumes containing int64 '
-                    'label data, and `dataset` is the name of the dataset '
-                    'from which data will be read.')
-flags.DEFINE_string('tf_coords', None, 
-                    'Prefix to tfrecord files with coordinates')
+flags.DEFINE_integer('mip', 0, '')
+# flags.DEFINE_string('chunk_size', '128,128,128', '')
+flags.DEFINE_string('factor', '4,4,1', '')
 flags.DEFINE_string('train_dir', None, '')
 flags.DEFINE_string('model_name', None,
                     'Name of the model to train. Format: '
@@ -68,14 +43,43 @@ flags.DEFINE_string('model_args', None,
                     'constructor.')
 flags.DEFINE_float('learning_rate', 0.001, '')
 flags.DEFINE_integer('batch_size', 1, '')
-flags.DEFINE_float('image_mean', 128, '')
-flags.DEFINE_float('image_stddev', 33, '')
 flags.DEFINE_integer('max_steps', 100000, '')
 flags.DEFINE_boolean('rotation', False, '')
 
-
-
 def main(unused_argv):
+  # chunk_size = np.array([int(i) for i in FLAGS.chunk_size.split(',')])
+  model_args = json.loads(FLAGS.model_args)
+  chunk_size = tuple([int(i) for i in model_args['fov_size']])
+  factor = np.array([int(i) for i in FLAGS.factor.split(',')])
+  seg_cv = cloudvolume.CloudVolume('file://%s' % FLAGS.segmentation_vol, 
+    mip=FLAGS.mip, progress=False)
+  resolution = seg_cv.meta.resolution(FLAGS.mip)
+
+  # sample_loc = np.array([9553, 13099, 187])
+  # sample_loc = sample_loc // factor
+  # sample_bb = loc_to_bbox(sample_loc, chunk_size)
+  # sample_chunk = np.array(seg_cv[sample_bb])[..., 0]
+  # offset = sample_loc - chunk_size // 2
+
+  # pair_dicts = training_data_prep_v2(
+  #   sample_chunk,
+  #   resolution=resolution, 
+  #   offset=offset, 
+  #   rescale=factor)
+  # in_out = build_training_data(sample_chunk, pair_dicts)
+  # print(len(in_out))
+
+  # ds = merge_input_fn(seg_cv, chunk_size, factor, 
+  #   n_samples=200, batch_size=FLAGS.batch_size)
+  # # value = tf.compat.v1.data.make_initializable_iterator(ds).get_next()
+  # value = tf.compat.v1.data.make_one_shot_iterator(ds).get_next()
+  # with tf.compat.v1.Session() as sess:
+  #   for _ in range(40):
+  #     features, label = sess.run(value)
+  #     print(features['center'], features['id_a'], features['id_b'])
+  #     print(features['fuse_mask'].shape, label.shape)
+
+  # Training
   hvd.init()
   model_class = import_symbol(FLAGS.model_name, 'ffn_mask')
   model_args = json.loads(FLAGS.model_args)
@@ -113,7 +117,7 @@ def main(unused_argv):
 
   model_dir = FLAGS.train_dir if hvd.rank() == 0 else None
   save_summary_steps = 90 if hvd.rank() == 0 else None
-  save_checkpoints_secs = 540 if hvd.rank() == 0 else None
+  save_checkpoints_secs = 180 if hvd.rank() == 0 else None
 
   config=tf.estimator.RunConfig( 
     model_dir=model_dir,
@@ -129,44 +133,21 @@ def main(unused_argv):
     )
   bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
   # logging_hook = tf.estimator.LoggingTensorHook(
-  # # logging_hook = tf.train.LoggingTensorHook(
   #   {'flat_logits': 'flat_logits',
   #    'flat_labels': 'flat_labels'},
-  #   #  'flat_weights': 'flat_weights'},
   #    every_n_iter=100,
   # )
-
-  if FLAGS.weights_volumes:
-    input_fn = io_utils.train_input_fn_with_weight(
-      FLAGS.data_volumes, 
-      FLAGS.label_volumes, 
-      FLAGS.weights_volumes,
-      FLAGS.tf_coords,
-      num_classes,
-      fov_size, 
-      label_size,
-      FLAGS.batch_size, 
-      FLAGS.image_mean, 
-      FLAGS.image_stddev,
-      FLAGS.rotation)
-  else:
-    input_fn = io_utils.train_input_fn(
-      FLAGS.data_volumes, 
-      FLAGS.label_volumes, 
-      FLAGS.tf_coords,
-      num_classes,
-      fov_size, 
-      label_size,
-      FLAGS.batch_size, 
-      FLAGS.image_mean, 
-      FLAGS.image_stddev,
-      FLAGS.rotation)
+  input_fn = lambda: merge_input_fn(
+    seg_cv, 
+    chunk_size, 
+    factor, 
+    n_samples=FLAGS.max_steps, 
+    batch_size=FLAGS.batch_size)
 
   mask_estimator.train(
     input_fn=input_fn,
     steps=FLAGS.max_steps,
-    hooks=[bcast_hook])
-    # hooks=[bcast_hook, logging_hook])
+    hooks=[bcast_hook])#, logging_hook])
 
 if __name__ == '__main__':
   app.run(main)

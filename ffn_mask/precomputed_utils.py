@@ -68,7 +68,8 @@ def load_from_precomputed(coord_tensor, volume, chunk_shape, volume_axes='xyz'):
   num_classes = volume.shape[-1]
   logging.warn('weird class: %d %s', num_classes, volume.shape)
   with tf.name_scope('load_from_h5') as scope:
-    loaded = tf.py_func(
+    loaded = tf.compat.v1.py_func(
+    # loaded = tf.numpy_function(
         _load_from_numpylike, [coord_tensor], [dtype],
         name=scope)[0]
     # logging.warn('before %s', loaded.shape)

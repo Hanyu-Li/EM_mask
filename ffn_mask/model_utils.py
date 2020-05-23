@@ -29,16 +29,19 @@ def ortho_cut(volume, batch_size):
 def ortho_project(volume, batch_size):
   '''Concat orthogonal cuts'''
   b,z,y,x,c = volume.get_shape().as_list()
-  # b = batch_size
+  b = batch_size
   # convert first dim to 0
   # zero_first = tf.zeros([b, z, y, x, 1], dtype=tf.float32)
   # new_volume = tf.concat([zero_first, volume[...,1:]], axis=-1)
   # logging.warn('old_volume_shape: %s', volume.shape)
   # logging.warn('new_volume_shape: %s', new_volume.shape)
   #print(b,z,y,x,c)
-  yx = volume[0:b,z//2,:,:,:]
-  zx = volume[0:b,:,y//2,:,:]
-  zy = volume[0:b,:,:,x//2,:]
+  # yx = volume[0:b,z//2,:,:,:]
+  # zx = volume[0:b,:,y//2,:,:]
+  # zy = volume[0:b,:,:,x//2,:]
+  yx = tf.reduce_mean(volume[0:b, ...], axis=1)
+  zx = tf.reduce_mean(volume[0:b, ...], axis=2)
+  zy = tf.reduce_mean(volume[0:b, ...], axis=3)
   # yx = tf.reduce_mean(new_volume, axis=1)
   # zx = tf.reduce_mean(new_volume, axis=2)
   # zy = tf.reduce_mean(new_volume, axis=3)
@@ -323,7 +326,9 @@ def mask_model_fn_regression(features, labels, mode, params):
     with tf.control_dependencies(update_ops):
       train_op = optimizer.minimize(loss, global_step=tf.compat.v1.train.get_global_step())
       # train_op = optimizer.minimize(loss)
-    tf.compat.v1.summary.image('image', ortho_cut(features['image'], batch_size), 
+    # tf.compat.v1.summary.image('image', ortho_cut(features['image'], batch_size), 
+    #   max_outputs=batch_size)
+    tf.compat.v1.summary.image('image', ortho_project(features['image'], batch_size), 
       max_outputs=batch_size)
     tf.compat.v1.summary.image('labels', ortho_project(labels, batch_size), 
       max_outputs=batch_size)

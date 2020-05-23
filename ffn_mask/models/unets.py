@@ -528,6 +528,62 @@ def unet_with_bn_noniso_keras(patches, num_classes):
     logging.warn('conv8: %s', output.shape)
     return output
 
+def unet_noniso_keras(patches, num_classes):
+  with tf.name_scope('unet'):
+    conv = tf.keras.layers.Conv3D
+    upconv = tf.keras.layers.Conv3DTranspose
+    pool = tf.keras.layers.MaxPool3D
+    batch_norm = tf.keras.layers.BatchNormalization
+    concat_axis = 4
+    padding_mode = 'same'
+
+    # conv0 = conv_bn_relu_keras(3, (1, 1, 1), padding='same', name='conv_0')(patches)
+    conv1 = conv_relu_keras(32, (1, 3, 3), padding=padding_mode, name='conv_1a')(patches)
+    conv1 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_1b')(conv1)
+    pool1 = pool((1, 2, 2), name='pool_1')(conv1)
+    logging.warn('conv1: %s', conv1.shape)
+
+    conv2 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_2a')(pool1)
+    conv2 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_2b')(conv2)
+    pool2 = pool((1, 2, 2), name='pool_2')(conv2)
+    logging.warn('conv2: %s', conv2.shape)
+
+    conv3 = conv_relu_keras(128, (3, 3, 3), padding=padding_mode, name='conv_3a')(pool2)
+    conv3 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_3b')(conv3)
+    pool3 = pool((2, 2, 2), name='pool_3')(conv3)
+    logging.warn('conv3: %s', conv3.shape)
+
+    conv4 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_4a')(pool3)
+    conv4 = conv_relu_keras(512, (3, 3, 3), padding=padding_mode, name='conv_4b')(conv4)
+    logging.warn('conv4: %s', conv4.shape)
+
+    upconv5 = upconv(512, (2, 2, 2), strides=(2, 2, 2), padding=padding_mode, name='upconv_5')(conv4)
+    # concat5 = tf.concat([conv3, upconv5], axis=4, name='concat_5')
+    concat5 = crop_concat(conv3, upconv5, name='concat_5')
+    conv5 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5a')(concat5)
+    conv5 = conv_relu_keras(256, (3, 3, 3), padding=padding_mode, name='conv_5b')(conv5)
+
+    upconv6 = upconv(256, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_6')(conv5)
+    # concat6 = tf.concat([conv2, upconv6], axis=4, name='concat_6')
+    concat6 = crop_concat(conv2, upconv6, name='concat_6')
+    conv6 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6a')(concat6)
+    conv6 = conv_relu_keras(128, (1, 3, 3), padding=padding_mode, name='conv_6b')(conv6)
+
+    upconv7 = upconv(128, (1, 2, 2), strides=(1, 2, 2), padding=padding_mode, name='upconv_7')(conv6)
+    # concat7 = tf.concat([conv1, upconv7], axis=4, name='concat_7')
+    concat7 = crop_concat(conv1, upconv7, name='concat_7')
+    conv7 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7a')(concat7)
+    conv7 = conv_relu_keras(64, (1, 3, 3), padding=padding_mode, name='conv_7b')(conv7)
+
+    # output = conv_bn_relu_keras(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+    output = conv(num_classes, (1, 1, 1), padding='same', name='conv_8')(conv7)
+
+    logging.warn('conv5: %s', conv5.shape)
+    logging.warn('conv6: %s', conv6.shape)
+    logging.warn('conv7: %s', conv7.shape)
+    logging.warn('conv8: %s', output.shape)
+    return output
+
 def unet_dtu_2(patches, num_classes):
   '''DTU-2 UNet from 
   Synaptic Cleft Segmentation in Non-isotropic Volume Electron Microscopy of the 
