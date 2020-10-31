@@ -11,15 +11,13 @@ import h5py
 import tensorflow as tf
 import numpy as np
 import itertools
-from skimage.segmentation import find_boundaries
+from cloudvolume import CloudVolume
 from ffn.utils import bounding_box
 from ffn.training import inputs
 from ffn.training.import_util import import_symbol
-# from ffn_mask import io_utils, model_utils
 from ffn_mask import precomputed_utils, model_utils
+from tqdm import tqdm
 
-
-# import horovod.tensorflow as hvd
 import sys
 import json
 
@@ -59,15 +57,58 @@ flags.DEFINE_integer('max_steps', 100000, '')
 flags.DEFINE_list('use_gpu', [], '')
 
 
+# def prepare_model(model_params, model_checkpoint, use_gpu=[]):
+#   if not len(use_gpu):
+#     sess_config = tf.ConfigProto(
+#       device_count={'GPU': 0}
+#     )
+#   else:
+#     rank_gpu = str(mpi_rank % len(use_gpu))
+#     gpu_options = tf.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
+#     sess_config = tf.ConfigProto(
+#       gpu_options=gpu_options
+#     )
+
+#   # sess_config.gpu_options.allow_growth = True
+#   # sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
+
+#   if model_params['num_classes'] == 1:
+#     model_fn = model_utils.mask_model_fn_regression  
+#   else:
+#     model_fn = model_utils.mask_model_fn_classfication
+
+#   # model_checkpoint = FLAGS.model_checkpoint if hvd.rank() == 0 else None
+#   model_checkpoint = FLAGS.model_checkpoint
+
+#   config=tf.estimator.RunConfig( 
+#     session_config=sess_config,
+#   )
+#   mask_estimator = tf.estimator.Estimator(
+#     model_fn=model_fn,
+#     config=config,
+#     params=model_params,
+#     warm_start_from=model_checkpoint
+#   )
+#   # bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
+# 
+  # return mask_estimator
+
+
 def prepare_model(model_params, model_checkpoint, use_gpu=[]):
   if not len(use_gpu):
-    sess_config = tf.ConfigProto(
+    sess_config = tf.compat.v1.ConfigProto(
       device_count={'GPU': 0}
     )
   else:
+    # gpus = tf.config.experimental.list_physical_devices('GPU')
+    # for gpu in gpus:
+    #     tf.config.experimental.set_memory_growth(gpu, True)
+    # if gpus:
+    #     tf.config.experimental.set_visible_devices(gpus[mpi_rank], 'GPU')
+    # logging.warning('phys gpus: %s', gpus)
     rank_gpu = str(mpi_rank % len(use_gpu))
-    gpu_options = tf.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
-    sess_config = tf.ConfigProto(
+    gpu_options = tf.compat.v1.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
+    sess_config = tf.compat.v1.ConfigProto(
       gpu_options=gpu_options
     )
 
@@ -91,11 +132,8 @@ def prepare_model(model_params, model_checkpoint, use_gpu=[]):
     params=model_params,
     warm_start_from=model_checkpoint
   )
-  # bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
 
   return mask_estimator
-
-
 
 def main(unused_argv):
   # hvd.init()
@@ -107,8 +145,6 @@ def main(unused_argv):
     input_offset= np.array([int(i) for i in FLAGS.input_offset.split(',')])
     input_size= np.array([int(i) for i in FLAGS.input_size.split(',')])
   else:
-    # input_offset = None
-    # input_size = None
     input_offset, input_size = precomputed_utils.get_offset_and_size(FLAGS.input_volume)
 
   if 'label_size' in model_args:
@@ -116,8 +152,14 @@ def main(unused_argv):
   else:
     label_size = fov_size
     model_args['label_size'] = label_size
+
   input_mip = FLAGS.input_mip
+  input_cv = CloudVolume('file://%s' % FLAGS.input_volume, mip=FLAGS.input_mip)
+  resolution = input_cv.meta.resolution(FLAGS.input_mip)
   overlap = [int(i) for i in FLAGS.overlap]
+  num_bbox = precomputed_utils.get_num_bbox(input_offset, input_size, fov_size, overlap)
+  logging.warning('num bbox: %s', num_bbox)
+
   num_classes = int(model_args['num_classes'])
   params = {
     'model_class': model_class,
@@ -126,15 +168,11 @@ def main(unused_argv):
     'num_classes': num_classes
   }
   
-  # print('gpu', FLAGS.use_gpu)
-  # if len(FLAGS.use_gpu):
-  # print('rank_gpu', str(mpi_rank % FLAGS.use_gpu))
-
   mask_estimator = prepare_model(params, FLAGS.model_checkpoint, FLAGS.use_gpu)
   tensors_to_log = {
     "center": "center"
   }
-  logging_hook = tf.train.LoggingTensorHook(
+  logging_hook = tf.compat.v1.train.LoggingTensorHook(
     tensors=tensors_to_log, every_n_iter=1
   )
 
@@ -156,22 +194,6 @@ def main(unused_argv):
     hooks = [],
     yield_single_examples=False
   )
-  # for i, p in enumerate(predictions):
-  #   logging.warning('rank %d block %d', mpi_rank, i)
-  #   logging.warning('summaries: %s', p['class_prediction'].shape)
-  # # output_shapes = io_utils.get_h5_shapes(FLAGS.data_volumes)
-  # # output_shapes = io_utils.get_h5_shapes(FLAGS.data_volumes)
-  # output_shapes = {FLAGS.output_volumes.split(':')[0]: input_size[::-1]}
-  # io_utils.h5_sequential_chunk_writer_v2(
-  #   predictions,
-  #   output_volumes=FLAGS.output_volumes,
-  #   output_shapes=output_shapes,
-  #   num_classes=num_classes,
-  #   chunk_shape=fov_size,
-  #   label_shape=label_size,
-  #   overlap=overlap,
-  #   sub_bbox=FLAGS.bounding_box,
-  #   mpi=FLAGS.mpi)
 
   _ = precomputed_utils.writer(
     predictions,
@@ -180,7 +202,9 @@ def main(unused_argv):
     output_size=input_size,
     chunk_shape=fov_size,
     label_shape=label_size,
-    overlap=overlap
+    resolution=resolution,
+    overlap=overlap,
+    num_iter=num_bbox // mpi_size // FLAGS.batch_size
   )
 
 if __name__ == '__main__':

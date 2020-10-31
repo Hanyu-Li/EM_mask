@@ -226,6 +226,7 @@ def h5_sequential_chunk_writer(prediction_generator,
                                num_classes,
                                chunk_shape=(32, 64, 64),
                                overlap=(0, 0, 0),
+                               min_logit=-0.5,
                                mpi=False):
   '''Sequentially write chunks(with overlap) from volumes'''
   chunk_shape = np.array(chunk_shape)
@@ -245,7 +246,7 @@ def h5_sequential_chunk_writer(prediction_generator,
     output_shape = output_shapes[volname]
     # logging.warn('output_shape %s', output_shape)
     output_volume_map[volname] = f.create_dataset(name=dataset, shape=output_shape, dtype='float32')
-    logits_ds = f.create_dataset(name='logits', shape=list(output_shape)+[num_classes], dtype='float32') 
+    logits_ds = f.create_dataset(name='logits', shape=list(output_shape)+[num_classes], fillvalue=min_logit, dtype='float32') 
     # output_volume = np.zeros(shape=output_shapes[volname], dtype=np.float32)
     max_bbox = bounding_box.BoundingBox(start=(0,0,0), size=output_shapes[volname])
     for p in prediction_generator:

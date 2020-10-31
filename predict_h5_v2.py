@@ -138,11 +138,6 @@ def main(unused_argv):
   num_bbox = h5_utils.get_num_of_bbox(input_offset, input_size, fov_size, overlap)
   # else:
   #   num_bbox = None
-  
-  
-  # print('gpu', FLAGS.use_gpu)
-  # if len(FLAGS.use_gpu):
-  # print('rank_gpu', str(mpi_rank % FLAGS.use_gpu))
 
   mask_estimator = prepare_model(params, FLAGS.model_checkpoint, FLAGS.use_gpu)
   tensors_to_log = {

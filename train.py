@@ -120,7 +120,7 @@ def main(unused_argv):
     save_summary_steps=save_summary_steps,
     save_checkpoints_secs=save_checkpoints_secs,
     session_config=sess_config,
-    keep_checkpoint_max=100,
+    keep_checkpoint_max=10,
   )
   mask_estimator = tf.estimator.Estimator(
     model_fn=model_fn,

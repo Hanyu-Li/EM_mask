@@ -7,6 +7,7 @@ import logging
 from pprint import pprint
 import tensorflow as tf
 from ffn_mask.io_utils import load_from_numpylike, preprocess_image
+from tqdm import tqdm
 from mpi4py import MPI
 import os
 mpi_comm = MPI.COMM_WORLD
@@ -84,6 +85,11 @@ def get_offset_and_size(cv_path):
   input_size = np.array(cv.info['scales'][0]['size'])
   return input_offset, input_size
 
+def get_num_bbox(input_offset, input_size, chunk_size, overlap):
+  union_bbox = Bbox(input_offset, input_offset + input_size)
+  sub_bboxes = get_bboxes(union_bbox, chunk_size=chunk_size, overlap=overlap)
+  return len(sub_bboxes)
+
 def predict_input_fn_precomputed(
   input_volume,
   input_offset,
@@ -106,21 +112,11 @@ def predict_input_fn_precomputed(
 
   union_bbox = Bbox(input_offset, input_offset + input_size)
   sub_bboxes = get_bboxes(union_bbox, chunk_size=chunk_shape, overlap=overlap)
-
-  # bbox = bounding_box.BoundingBox(start=[0,0,0], size=input_size)
-  # logging.warn('global bbox: %s', bbox)
-  # def h5_sequential_bbox_gen():
-  #   calc = bounding_box.OrderlyOverlappingCalculator(
-  #     outer_box=bbox, 
-  #     sub_box_size=chunk_shape, 
-  #     overlap=overlap_padded, 
-  #     include_small_sub_boxes=True,
-  #     back_shift_small_sub_boxes=True)
-  #   for bb in calc.generate_sub_boxes():
-  #     yield [bb.start + bb.size // 2] # central coord which is io'ed
-  # print(sub_bboxes)
+  
+  rank_sub_bboxes = np.array_split(sub_bboxes, mpi_size)[mpi_rank]
+  logging.warning('ranked %d bb %d', mpi_rank, len(rank_sub_bboxes))
   def dummy_gen():
-    for sb in sub_bboxes:
+    for sb in rank_sub_bboxes:
       # logging.warning('load bbox %s', (sb.minpt + sb.maxpt) // 2)
       yield [(sb.minpt + sb.maxpt) // 2]
 
@@ -132,8 +128,9 @@ def predict_input_fn_precomputed(
   )
   # ds = ds.apply(
   #   tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
-  ds = ds.apply(
-    tf.data.experimental.filter_for_shard(mpi_size, mpi_rank))
+  # ds = ds.shard(mpi_size, mpi_rank)
+  # ds = ds.apply(
+  #   tf.data.experimental.filter_for_shard(mpi_size, mpi_rank))
   ds = ds.map(lambda coord: (
       coord, 
       load_from_precomputed(coord, cv, chunk_shape, volume_axes='xyz')),
@@ -151,8 +148,6 @@ def predict_input_fn_precomputed(
   ds = ds.batch(batch_size)
   return ds
 
-
-
 def writer(
   prediction_generator,
   output_volume,
@@ -160,7 +155,10 @@ def writer(
   output_size,
   chunk_shape,
   label_shape,
-  overlap):
+  resolution,
+  overlap,
+  num_iter
+  ):
   if mpi_rank == 0:
     # create two separate cvs for output
     cv_args = dict(
@@ -171,28 +169,26 @@ def writer(
     logits_info = cloudvolume.CloudVolume.create_new_info(
       num_channels=1,
       layer_type='image',
-      data_type='float32',
+      data_type='uint8',
       encoding='raw',
-      resolution=(6,6,40),
+      resolution=resolution,
       voxel_offset=output_offset,
       volume_size=output_size,
-      chunk_size=(64, 64, 64),
+      chunk_size=(256, 256, 64),
       max_mip=0,
       factor=(2,2,1))
     logits_path = os.path.join(output_volume, 'logits')
     logits_cv = cloudvolume.CloudVolume('file://%s' % logits_path, mip=0, info=logits_info, **cv_args)
     logits_cv.commit_info()
-
-
     class_info = cloudvolume.CloudVolume.create_new_info(
       num_channels=1,
       layer_type='segmentation',
       data_type='uint8',
       encoding='raw',
-      resolution=(6,6,40),
+      resolution=resolution,
       voxel_offset=output_offset,
       volume_size=output_size,
-      chunk_size=(64, 64, 64),
+      chunk_size=(256, 256, 64),
       max_mip=0,
       factor=(2,2,1))
     class_path = os.path.join(output_volume, 'class_predictions')
@@ -206,27 +202,36 @@ def writer(
 
   chunk_shape = np.array(chunk_shape)
   
-  for i, p in enumerate(prediction_generator): 
+  # write without padding 
+  padding = np.array(overlap) // 2
+
+  for i, p in tqdm(enumerate(prediction_generator), desc='bbox', total=num_iter): 
     assert 'logits' in p and 'class_prediction' in p
-    logging.warning('center %s', p['center'])
+    # logging.warning('center %s', p['center'])
+    # offset = c[0] - chunk_shape // 2
+    # size = chunk_shape
+
+
     bboxes = [
-      Bbox(a=c[0] - chunk_shape // 2, 
-           b=c[0] + chunk_shape // 2)
+      Bbox(a=c[0] - chunk_shape // 2 + padding, 
+           b=c[0] - chunk_shape // 2 + chunk_shape - padding)
       for c in p['center']
     ]
-    logging.warning('bboxes %s', bboxes)
-    for i, b in enumerate(bboxes):
+    # logging.warning('bboxes %s', bboxes)
+
+    for i, b in tqdm(enumerate(bboxes), desc='batch', disable=True):
       logits_chunk = p['logits'][i].transpose((2,1,0,3))
       class_chunk = p['class_prediction'][i].transpose((2,1,0))
       # class_chunk = p['class_prediction'][i] 
       # logging.warning('logits shape %s', logits_chunk.shape)
       # logging.warning('class shape %s', class_chunk.shape)
-      logits_cv[b] = logits_chunk
-      class_cv[b] = np.uint8(class_chunk)
+      in_shape = logits_chunk.shape
+      in_slc = np.s_[
+        padding[0]:in_shape[0]-padding[0],
+        padding[1]:in_shape[1]-padding[1],
+        padding[2]:in_shape[2]-padding[2]
+      ]
+      norm_logits_chunk = np.floor(255 * (np.clip(logits_chunk, -0.5, 0.5) + 0.5)).astype(np.uint8)
+      logits_cv[b] = norm_logits_chunk[in_slc]
+      class_cv[b] = np.uint8(class_chunk[in_slc])
 
-    # for b in bbox:
-    # logits = 
-    # bbox = Bbox(a=p['center'] - chunk_shape // 2, 
-    #             b=p['center'] + chunk_shape // 2)
-    # logging.warning('rank %d bbox %s', mpi_rank, bbox)
-    # logits_cv[]

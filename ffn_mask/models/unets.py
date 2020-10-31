@@ -202,6 +202,7 @@ def pad_concat(a, b, name=''):
   shape_a = np.array(a.shape.as_list())[1:4]
   shape_b = np.array(b.shape.as_list())[1:4]
   assert (shape_a >= shape_b).all()
+  # logging.warning('debug_shape: %s %s', shape_a, shape_b)
   assert ((shape_a - shape_b) % 2 == 0).all()
   start = (shape_a - shape_b) // 2
   end =  shape_a - start

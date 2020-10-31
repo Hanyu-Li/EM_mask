@@ -328,7 +328,7 @@ def mask_model_fn_regression(features, labels, mode, params):
       # train_op = optimizer.minimize(loss)
     # tf.compat.v1.summary.image('image', ortho_cut(features['image'], batch_size), 
     #   max_outputs=batch_size)
-    tf.compat.v1.summary.image('image', ortho_project(features['image'], batch_size), 
+    tf.compat.v1.summary.image('image', ortho_cut(features['image'], batch_size), 
       max_outputs=batch_size)
     tf.compat.v1.summary.image('labels', ortho_project(labels, batch_size), 
       max_outputs=batch_size)
