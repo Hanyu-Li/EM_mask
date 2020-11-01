@@ -5,7 +5,7 @@ import logging
 import tensorflow as tf
 from ffn.utils import bounding_box
 from .precomputed_utils import get_bboxes
-from ffn_mask.io_utils import preprocess_image
+from em_mask.io_utils import preprocess_image
 from mpi4py import MPI
 from pprint import pprint
 from tqdm import tqdm
@@ -27,15 +27,7 @@ def load_from_h5(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
   """
   chunk_shape = np.array(chunk_shape)
   def _load_from_numpylike(coord):
-    # starts = np.array(coord[0]) - (chunk_shape-1) // 2
     starts = np.array(coord[0]) - chunk_shape // 2
-    # bbox = Bbox(a=starts, b=starts+chunk_shape)
-    # width = np.array(chunk_shape) // 2
-    # logging.warning('py_func: %s %s', coord, width)
-    # slc = np.s_[coord[0] - width[0]:coord[0] + width[0],
-    #   coord[1] - width[1]:coord[1] + width[1],
-    #   coord[2] - width[2]:coord[2] + width[2]
-    # ]
     slc = np.s_[starts[0]:starts[0] + chunk_shape[0],
                starts[1]:starts[1] + chunk_shape[1],
                starts[2]:starts[2] + chunk_shape[2]]
@@ -43,9 +35,7 @@ def load_from_h5(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
       data = np.expand_dims(volume[slc][...], axis=-1)
     if volume_axes == 'zyx':
       slc = slc[::-1]
-      # logging.warning('load slc: %s', slc)
       data = np.expand_dims(volume[slc][...], axis=-1)
-      # logging.warning('load chunk: %s', data.shape)
     else:
       raise ValueError('volume_axes mush either be "zyx" or "xyz"')
     return data
@@ -55,23 +45,45 @@ def load_from_h5(coord_tensor, volume, chunk_shape, volume_axes='zyx'):
     num_classes = 1
   else:
     num_classes = volume.shape[-1]
-  # logging.warn('weird class: %d %s', num_classes, volume.shape)
   with tf.name_scope('load_from_h5') as scope:
     loaded = tf.compat.v1.py_func(
         _load_from_numpylike, [coord_tensor], [dtype],
         name=scope)[0]
-    # logging.warn('before %s', loaded.shape)
     loaded.set_shape(list(chunk_shape[::-1]) + [num_classes])
-    # loaded.set_shape(list(chunk_shape[::]) + [num_classes])
-    # logging.warn('after %s', loaded.shape)
     return loaded
+
 def get_num_of_bbox(input_offset, input_size, chunk_shape, overlap):
   union_bbox = bounding_box.BoundingBox(start=input_offset, size=input_size)
   sub_bboxes = get_bboxes(union_bbox, chunk_size=chunk_shape, 
     overlap=overlap, back_shift_small=True, backend='ffn')
   return len(sub_bboxes)
 
-def predict_input_fn_h5_v2(
+def h5_random_chunk_generator(data_volumes, label_volumes, num_classes, chunk_shape=(32, 64, 64)):
+  '''Randomly generate chunks from volumes'''
+  image_volume_map = {}
+  for vol in data_volumes.split(','):
+    volname, path, dataset = vol.split(':')
+    image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+
+  label_volume_map = {}
+  for vol in label_volumes.split(','):
+    volname, path, dataset = vol.split(':')
+    label_volume_map[volname] = tf.keras.utils.to_categorical(
+      h5py.File(path, 'r')[dataset])
+  def gen():
+    chunk_offset = (np.array(chunk_shape)) // 2
+    for key, val in image_volume_map.items():
+      data_shape = val.shape
+      valid_max = [d-c for d,c in zip(data_shape, chunk_shape)]
+      for i in itertools.count(1):
+        center = np.floor(np.random.rand(3) * valid_max).astype(np.int64) + chunk_offset
+        image, label = (
+          _load_from_numpylike_v2(center, val, chunk_offset, chunk_shape),
+          _load_from_numpylike_v2(center, label_volume_map[key], chunk_offset, chunk_shape))
+        yield (center, image, label)
+  return gen
+
+def predict_input_fn_h5(
   input_volume,
   input_offset, 
   input_size,
@@ -87,7 +99,8 @@ def predict_input_fn_h5_v2(
   For incoming h5 volume, break down into sub bboxes, and use subsets according
   to mpi rank
   """
-  volname, path, dataset = input_volume.split(':')
+  # volname, path, dataset = input_volume.split(':')
+  path, dataset = input_volume.split(':')
   if input_offset is None or input_size is None:
     with h5py.File(path, 'r') as f:
       input_size = f[dataset].shape[::-1]
@@ -99,16 +112,11 @@ def predict_input_fn_h5_v2(
     ]
   logging.warn('slc: %s', slc)
 
-  # with h5py.File(path, 'r') as f:
-  #   # data = np.expand_dims(f[dataset][slc], axis=-1)
-  #   data = np.expand_dims(f[dataset][slc], axis=-1)
-
   f_in = h5py.File(path, 'r')
   data = f_in[dataset]
 
   logging.warning('data_shape %s', data.shape)
   # this bbox coord is relative to offset 
-  # union_bbox = bounding_box.BoundingBox(start=[0,0,0], size=input_size)
 
   if mpi_rank == 0:
     union_bbox = bounding_box.BoundingBox(start=input_offset, size=input_size)
@@ -121,30 +129,22 @@ def predict_input_fn_h5_v2(
   ranked_sub_bboxes = mpi_comm.scatter(ranked_sub_bboxes, 0)
   
   logging.warning('num_sub_bbox %d %s', len(ranked_sub_bboxes), ranked_sub_bboxes[0])
-  # logging.warning('bbox %s %s', ranked_sub_bboxes[0].minpt, ranked_sub_bboxes[0].maxpt)
   logging.warning('bbox %s %s', ranked_sub_bboxes[0].start, ranked_sub_bboxes[0].end)
   def sub_bbox_iterator():
     for sb in ranked_sub_bboxes:
-      # logging.warning('load bbox %s', (sb.start + sb.end) // 2)
       yield [(sb.start + sb.end) // 2]
-  # in_out_diff = (np.array(chunk_shape) - np.array(label_shape)) // 2
-  # overlap_padded = overlap + in_out_diff
 
   ds = tf.data.Dataset.from_generator(
     generator=sub_bbox_iterator, 
     output_types=(tf.int64), 
     output_shapes=(tf.TensorShape((1,3)))
   )
-  # ds = ds.apply(
-  #   tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
   ds = ds.map(lambda coord: (
       coord, 
       load_from_h5(coord, data, chunk_shape)),
     num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
     num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  # )
-    # num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.map(lambda coord, image:
     {
       'center': coord,
@@ -155,7 +155,8 @@ def predict_input_fn_h5_v2(
   return ds
 
 def get_h5_shape(data_volume):
-  volname, path, dataset = data_volume.split(':')
+  # volname, path, dataset = data_volume.split(':')
+  path, dataset = data_volume.split(':')
   return h5py.File(path,'r')[dataset].shape
 
 def h5_mpi_writer(
@@ -174,52 +175,31 @@ def h5_mpi_writer(
   chunk_shape = np.array(chunk_shape)
   label_shape = np.array(label_shape)
   overlap = np.array(overlap)
-  # chunk_offset = chunk_shape // 2
-  # overlap = np.array(overlap)
-  # if axes == 'zyx':
-  #   chunk_shape = chunk_shape[::-1]
-  #   chunk_offset = chunk_offset[::-1]
-    # overlap = chunk_shape[::-1]
-  # step_shape = chunk_shape - overlap
   output_volume_map = {}
   
-  # for vol in output_volumes.split(','):
-  volname, path, dataset = output_volume.split(':')
+  # volname, path, dataset = output_volume.split(':')
+  # output_path
   if not mpi:
-    f = h5py.File(path, 'w')
+    f = h5py.File(output_volume, 'w')
   else:
-    f = h5py.File(path, 'w', driver='mpio', comm=MPI.COMM_WORLD)
+    f = h5py.File(output_volume, 'w', driver='mpio', comm=MPI.COMM_WORLD)
 
-  # output_shape = output_shapes[volname]
-  # output_shape = output_shapes[volname]
   output_size = output_size[::-1]
   logging.warn('output_shape %s', output_size)
   logits_ds = f.create_dataset(name='logits', shape=list(output_size)+[num_classes], 
-    fillvalue=0,
+    fillvalue=-0.5,
     dtype='float32') 
   class_prediction_ds = f.create_dataset(name='class_prediction', shape=output_size, 
     fillvalue=0, dtype='float32')
-  # output_volume = np.zeros(shape=output_shapes[volname], dtype=np.float32)
-  # max_bbox = bounding_box.BoundingBox(start=(0,0,0), size=output_size[::-1])
-  # logging.warn('bbox %s', max_bbox)
   write_size = chunk_shape  - overlap
   zyx_overlap = overlap[::-1]
   logging.warning('write_size %s', write_size)
-  # for p in tqdm(prediction_generator, total=3080):
   for p in tqdm(prediction_generator, total=num_iter):
-    # center, logits, class_prediction = p['center'], p['logits'], p['class_prediction']
-    # logging.warn('pred shape %s %s', center, class_prediction.shape)
-    # logging.warn('pred result: %s', np.mean(logits[:]))
-    # logging.warn('pred %s %s %s', center, logits.shape, np.mean(logits[:]))
     for center, logits, class_prediction in zip(p['center'], p['logits'], p['class_prediction']):
-    # for center, logits, class_prediction in zip(p['center'], p['logits'], p['class_prediction']):
-      # logging.warn('pred %s %s %s', center, logits.shape, np.mean(logits[:]))
       zyx_center = center[0][::-1] - output_offset[::-1]
       zyx_write_size = write_size[::-1]
 
       zyx_start = zyx_center - zyx_write_size // 2
-      # zyx_write_rad = zyx_write_size // 2
-      # zyx_write_rad[zyx_write_rad == 0] = 1
 
       w_slc = np.s_[
         zyx_start[0] : zyx_start[0] + zyx_write_size[0], 
@@ -230,61 +210,7 @@ def h5_mpi_writer(
         zyx_overlap[1] // 2: zyx_overlap[1] // 2 + zyx_write_size[1],
         zyx_overlap[2] // 2: zyx_overlap[2] // 2 + zyx_write_size[2],
       ]
-      # logging.warning('write slc %s read slc %s', w_slc, r_slc)
-      # logging.warning('pred_center %s, write_center %s', center, zyx_start + zyx_write_size // 2)
-      # logging.warning('overlap %s', zyx_overlap)
-      # logging.warning('writing shape: %s', logits[r_slc].shape)
-
-      # w_size = w_slc[0].stop - w_slc[0].start
-      # if 
-
-
-
-      # try:
-      # logging.warning('wr shapes: %s, %s, %s', 
-      #   logits_ds[w_slc].shape, logits[r_slc].shape)
       assert logits_ds[w_slc].shape == logits[r_slc].shape
       logits_ds[w_slc] = np.array(logits[r_slc])
       class_prediction_ds[w_slc] = class_prediction[r_slc]
   f.close()
-
-      # zyx_center = center
-
-#   for p in prediction_generator:
-#     center, logits, class_prediction = p['center'][0], p['logits'], p['class_prediction']
-#     logging.warn('pred shape %s %s', center, class_prediction.shape)
-
-#     # deal with initial boarders
-#     if (center - label_shape // 2 == 0).any():
-#       r_start = np.array([0,0,0])
-#       w_start = center - label_shape // 2
-#       r_size = label_shape
-#       w_size = label_shape
-#     else:
-#       r_start = overlap // 2
-#       w_start = center - label_shape // 2 + overlap // 2
-#       r_size = label_shape - overlap // 2
-#       w_size = label_shape - overlap // 2
-#     # logging.warning('io: %s, %s, %s, %s, %s', center, r_start, r_size, w_start, w_size)
-
-#     r_slc = np.s_[
-#       r_start[2]:r_start[2] + r_size[2],
-#       r_start[1]:r_start[1] + r_size[1],
-#       r_start[0]:r_start[0] + r_size[0],
-#     ]
-#     w_slc = np.s_[
-#       w_start[2]:w_start[2] + w_size[2],
-#       w_start[1]:w_start[1] + w_size[1],
-#       w_start[0]:w_start[0] + w_size[0],
-#     ]
-#     logging.warning('slc: %s, %s', r_slc, w_slc)
-#     # print(logits.shape)
-#     # logits_ds[w_slc] = logits[r_slc]
-#     # class_prediction_ds[w_slc] = class_prediction[r_slc]
-#     logits_ds[w_slc] = logits[r_slc]
-#     class_prediction_ds[w_slc] = class_prediction[r_slc]
-
-
-#     # logging.warn('pred shape %s', pred[read_slices].shape)
-#     # output_volume_map[volname][write_slices] = pred[read_slices]
-# #       output_volume[write_slices] = pred[read_slices+(0,)]

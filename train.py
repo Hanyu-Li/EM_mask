@@ -1,4 +1,4 @@
-'''Script for training a mask classification model.'''
+'''Training a mask classification model.'''
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -10,24 +10,16 @@ from absl import logging
 import os
 import h5py
 import horovod.tensorflow as hvd
-# hvd.init()
-# os.environ['CUDA_VISIBLE_DEVICES'] = str(hvd.local_rank())
 import tensorflow as tf
 tf.compat.v1.disable_eager_execution()
 import numpy as np
 import itertools
-# from skimage.segmentation import find_boundaries
-# from ffn.utils import bounding_box
-# from ffn.training import inputs
 from ffn.training.import_util import import_symbol
-from ffn_mask import io_utils
-from ffn_mask import model_utils
+from em_mask import io_utils, model_utils
 
 import sys
 from mpi4py import MPI
 import json
-
-# tf.disable_v2_behavior()
 
 comm = MPI.COMM_WORLD
 rank = comm.rank
@@ -77,7 +69,7 @@ flags.DEFINE_boolean('rotation', False, '')
 
 def main(unused_argv):
   hvd.init()
-  model_class = import_symbol(FLAGS.model_name, 'ffn_mask')
+  model_class = import_symbol(FLAGS.model_name, 'em_mask')
   model_args = json.loads(FLAGS.model_args)
   fov_size= tuple([int(i) for i in model_args['fov_size']])
   if 'label_size' in model_args:
@@ -89,7 +81,6 @@ def main(unused_argv):
 
   if num_classes == 1:
     model_fn = model_utils.mask_model_fn_regression  
-    # model_fn = model_utils.mask_model_fn_classfication
   else:
     model_fn = model_utils.mask_model_fn_classfication
 
@@ -107,7 +98,6 @@ def main(unused_argv):
   if gpus:
       tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
   sess_config = tf.compat.v1.ConfigProto()
-  # sess_config = tf.config()
   sess_config.gpu_options.allow_growth = True
   sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
 
@@ -128,13 +118,6 @@ def main(unused_argv):
     params=params
     )
   bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
-  # logging_hook = tf.estimator.LoggingTensorHook(
-  # # logging_hook = tf.train.LoggingTensorHook(
-  #   {'flat_logits': 'flat_logits',
-  #    'flat_labels': 'flat_labels'},
-  #   #  'flat_weights': 'flat_weights'},
-  #    every_n_iter=100,
-  # )
 
   if FLAGS.weights_volumes:
     input_fn = io_utils.train_input_fn_with_weight(
@@ -166,7 +149,6 @@ def main(unused_argv):
     input_fn=input_fn,
     steps=FLAGS.max_steps,
     hooks=[bcast_hook])
-    # hooks=[bcast_hook, logging_hook])
 
 if __name__ == '__main__':
   app.run(main)

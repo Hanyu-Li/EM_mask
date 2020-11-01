@@ -1,4 +1,4 @@
-'''Script for predicting with a mask classification model.'''
+'''Prediction on precomputed volume with a mask classification model.'''
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -15,7 +15,7 @@ from cloudvolume import CloudVolume
 from ffn.utils import bounding_box
 from ffn.training import inputs
 from ffn.training.import_util import import_symbol
-from ffn_mask import precomputed_utils, model_utils
+from em_mask import precomputed_utils, model_utils
 from tqdm import tqdm
 
 import sys
@@ -57,70 +57,23 @@ flags.DEFINE_integer('max_steps', 100000, '')
 flags.DEFINE_list('use_gpu', [], '')
 
 
-# def prepare_model(model_params, model_checkpoint, use_gpu=[]):
-#   if not len(use_gpu):
-#     sess_config = tf.ConfigProto(
-#       device_count={'GPU': 0}
-#     )
-#   else:
-#     rank_gpu = str(mpi_rank % len(use_gpu))
-#     gpu_options = tf.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
-#     sess_config = tf.ConfigProto(
-#       gpu_options=gpu_options
-#     )
-
-#   # sess_config.gpu_options.allow_growth = True
-#   # sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
-
-#   if model_params['num_classes'] == 1:
-#     model_fn = model_utils.mask_model_fn_regression  
-#   else:
-#     model_fn = model_utils.mask_model_fn_classfication
-
-#   # model_checkpoint = FLAGS.model_checkpoint if hvd.rank() == 0 else None
-#   model_checkpoint = FLAGS.model_checkpoint
-
-#   config=tf.estimator.RunConfig( 
-#     session_config=sess_config,
-#   )
-#   mask_estimator = tf.estimator.Estimator(
-#     model_fn=model_fn,
-#     config=config,
-#     params=model_params,
-#     warm_start_from=model_checkpoint
-#   )
-#   # bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
-# 
-  # return mask_estimator
-
-
 def prepare_model(model_params, model_checkpoint, use_gpu=[]):
   if not len(use_gpu):
     sess_config = tf.compat.v1.ConfigProto(
       device_count={'GPU': 0}
     )
   else:
-    # gpus = tf.config.experimental.list_physical_devices('GPU')
-    # for gpu in gpus:
-    #     tf.config.experimental.set_memory_growth(gpu, True)
-    # if gpus:
-    #     tf.config.experimental.set_visible_devices(gpus[mpi_rank], 'GPU')
-    # logging.warning('phys gpus: %s', gpus)
     rank_gpu = str(mpi_rank % len(use_gpu))
     gpu_options = tf.compat.v1.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
     sess_config = tf.compat.v1.ConfigProto(
       gpu_options=gpu_options
     )
 
-  # sess_config.gpu_options.allow_growth = True
-  # sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
-
   if model_params['num_classes'] == 1:
     model_fn = model_utils.mask_model_fn_regression  
   else:
     model_fn = model_utils.mask_model_fn_classfication
 
-  # model_checkpoint = FLAGS.model_checkpoint if hvd.rank() == 0 else None
   model_checkpoint = FLAGS.model_checkpoint
 
   config=tf.estimator.RunConfig( 
@@ -136,8 +89,7 @@ def prepare_model(model_params, model_checkpoint, use_gpu=[]):
   return mask_estimator
 
 def main(unused_argv):
-  # hvd.init()
-  model_class = import_symbol(FLAGS.model_name, 'ffn_mask')
+  model_class = import_symbol(FLAGS.model_name, 'em_mask')
   model_args = json.loads(FLAGS.model_args)
   fov_size= tuple([int(i) for i in model_args['fov_size']])
 

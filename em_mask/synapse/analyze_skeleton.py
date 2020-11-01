@@ -1,3 +1,4 @@
+'''Given a precomputed volume with skeletons, compute total skeleton length.'''
 from copy import copy
 import numpy as np
 import neuroglancer
@@ -41,7 +42,6 @@ def count_length(segmentation_vol, id_text, output_dir):
     sub_ids = None
 
   seg_cv = CloudVolume('file://%s' % segmentation_vol, mip=1)
-  # sks = seg_cv.skeleton
 
   sub_ids = mpi_comm.scatter(sub_ids, 0)
 
@@ -57,7 +57,6 @@ def count_length(segmentation_vol, id_text, output_dir):
   mergeOp = MPI.Op.Create(merge_dict, commute=True)
   sk_len_dict = mpi_comm.reduce(sk_len_dict, op=mergeOp, root=0)
   if mpi_rank == 0:
-    # pprint(sk_len_dict)
     print('total_lenth', np.sum(list(sk_len_dict.values())))
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, 'len_dict.pkl'), 'wb') as f:

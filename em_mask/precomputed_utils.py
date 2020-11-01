@@ -6,7 +6,7 @@ import numpy as np
 import logging
 from pprint import pprint
 import tensorflow as tf
-from ffn_mask.io_utils import load_from_numpylike, preprocess_image
+from em_mask.io_utils import load_from_numpylike, preprocess_image
 from tqdm import tqdm
 from mpi4py import MPI
 import os
@@ -29,8 +29,6 @@ def get_bboxes(union_bbox, chunk_size, overlap=(0,0,0), back_shift_small=False, 
     include_small_sub_boxes=True,
     back_shift_small_sub_boxes=back_shift_small)
   bbs = list(calc.generate_sub_boxes())
-#   for ffn_bb in bbs:
-#     logging.warning('sub_bb: %s', ffn_bb)
   if backend == 'ffn':
     pass
   elif backend == 'cloudvolume':
@@ -52,7 +50,6 @@ def load_from_precomputed(coord_tensor, volume, chunk_shape, volume_axes='xyz'):
   """
   chunk_shape = np.array(chunk_shape)
   def _load_from_numpylike(coord):
-    # starts = np.array(coord[0]) - (chunk_shape-1) // 2
     starts = np.array(coord[0]) - chunk_shape // 2
     bbox = Bbox(a=starts, b=starts+chunk_shape)
     data = volume[bbox][...]
@@ -70,11 +67,8 @@ def load_from_precomputed(coord_tensor, volume, chunk_shape, volume_axes='xyz'):
   logging.warn('weird class: %d %s', num_classes, volume.shape)
   with tf.name_scope('load_from_h5') as scope:
     loaded = tf.compat.v1.py_func(
-    # loaded = tf.numpy_function(
         _load_from_numpylike, [coord_tensor], [dtype],
         name=scope)[0]
-    # logging.warn('before %s', loaded.shape)
-    # loaded.set_shape([1] + list(chunk_shape[::-1]) + [num_classes])
     loaded.set_shape(list(chunk_shape[::-1]) + [num_classes])
     logging.warn('after %s', loaded.shape)
     return loaded
@@ -117,7 +111,6 @@ def predict_input_fn_precomputed(
   logging.warning('ranked %d bb %d', mpi_rank, len(rank_sub_bboxes))
   def dummy_gen():
     for sb in rank_sub_bboxes:
-      # logging.warning('load bbox %s', (sb.minpt + sb.maxpt) // 2)
       yield [(sb.minpt + sb.maxpt) // 2]
 
 
@@ -126,19 +119,12 @@ def predict_input_fn_precomputed(
     output_types=(tf.int64), 
     output_shapes=(tf.TensorShape((1,3)))
   )
-  # ds = ds.apply(
-  #   tf.data.experimental.filter_for_shard(hvd.size(), hvd.rank()))
-  # ds = ds.shard(mpi_size, mpi_rank)
-  # ds = ds.apply(
-  #   tf.data.experimental.filter_for_shard(mpi_size, mpi_rank))
   ds = ds.map(lambda coord: (
       coord, 
       load_from_precomputed(coord, cv, chunk_shape, volume_axes='xyz')),
      num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.map(lambda coord, image: (coord, preprocess_image(image, offset, scale)),
      num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  # )
-    # num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.map(lambda coord, image:
     {
       'center': coord,
@@ -207,9 +193,6 @@ def writer(
 
   for i, p in tqdm(enumerate(prediction_generator), desc='bbox', total=num_iter): 
     assert 'logits' in p and 'class_prediction' in p
-    # logging.warning('center %s', p['center'])
-    # offset = c[0] - chunk_shape // 2
-    # size = chunk_shape
 
 
     bboxes = [
@@ -217,14 +200,10 @@ def writer(
            b=c[0] - chunk_shape // 2 + chunk_shape - padding)
       for c in p['center']
     ]
-    # logging.warning('bboxes %s', bboxes)
 
     for i, b in tqdm(enumerate(bboxes), desc='batch', disable=True):
       logits_chunk = p['logits'][i].transpose((2,1,0,3))
       class_chunk = p['class_prediction'][i].transpose((2,1,0))
-      # class_chunk = p['class_prediction'][i] 
-      # logging.warning('logits shape %s', logits_chunk.shape)
-      # logging.warning('class shape %s', class_chunk.shape)
       in_shape = logits_chunk.shape
       in_slc = np.s_[
         padding[0]:in_shape[0]-padding[0],

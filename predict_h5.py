@@ -16,11 +16,8 @@ from ffn.utils import bounding_box
 from ffn.utils import geom_utils
 from ffn.training import inputs
 from ffn.training.import_util import import_symbol
-# from ffn_mask import io_utils, model_utils
-from ffn_mask import h5_utils, model_utils
+from em_mask import h5_utils, model_utils
 
-
-# import horovod.tensorflow as hvd
 import sys
 import json
 
@@ -64,27 +61,17 @@ def prepare_model(model_params, model_checkpoint, use_gpu=[]):
       device_count={'GPU': 0}
     )
   else:
-    # gpus = tf.config.experimental.list_physical_devices('GPU')
-    # for gpu in gpus:
-    #     tf.config.experimental.set_memory_growth(gpu, True)
-    # if gpus:
-    #     tf.config.experimental.set_visible_devices(gpus[mpi_rank], 'GPU')
-    # logging.warning('phys gpus: %s', gpus)
     rank_gpu = str(mpi_rank % len(use_gpu))
     gpu_options = tf.compat.v1.GPUOptions(visible_device_list=rank_gpu, allow_growth=True)
     sess_config = tf.compat.v1.ConfigProto(
       gpu_options=gpu_options
     )
 
-  # sess_config.gpu_options.allow_growth = True
-  # sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
-
   if model_params['num_classes'] == 1:
     model_fn = model_utils.mask_model_fn_regression  
   else:
     model_fn = model_utils.mask_model_fn_classfication
 
-  # model_checkpoint = FLAGS.model_checkpoint if hvd.rank() == 0 else None
   model_checkpoint = FLAGS.model_checkpoint
 
   config=tf.estimator.RunConfig( 
@@ -101,8 +88,7 @@ def prepare_model(model_params, model_checkpoint, use_gpu=[]):
 
 
 def main(unused_argv):
-  # hvd.init()
-  model_class = import_symbol(FLAGS.model_name, 'ffn_mask')
+  model_class = import_symbol(FLAGS.model_name, 'em_mask')
   model_args = json.loads(FLAGS.model_args)
   fov_size= tuple([int(i) for i in model_args['fov_size']])
 
@@ -110,19 +96,15 @@ def main(unused_argv):
     input_offset= np.array([int(i) for i in FLAGS.input_offset.split(',')])
     input_size= np.array([int(i) for i in FLAGS.input_size.split(',')])
   else:
-    # input_offset = None
-    # input_size = None
     input_offset = [0, 0, 0]
     input_size = h5_utils.get_h5_shape(FLAGS.input_volume)[::-1]
 
-    # input_offset, input_size = precomputed_utils.get_offset_and_size(FLAGS.input_volume)
 
   if 'label_size' in model_args:
     label_size = tuple([int(i) for i in model_args['label_size']])
   else:
     label_size = fov_size
     model_args['label_size'] = label_size
-  # input_mip = FLAGS.input_mip
   overlap = [int(i) for i in FLAGS.overlap]
   num_classes = int(model_args['num_classes'])
   params = {
@@ -132,12 +114,8 @@ def main(unused_argv):
     'num_classes': num_classes
   }
 
-  # larger output shape to allow some border padding
   output_size = np.array(input_size) + np.array(fov_size) // 2
-  # if mpi_rank == 0:
   num_bbox = h5_utils.get_num_of_bbox(input_offset, input_size, fov_size, overlap)
-  # else:
-  #   num_bbox = None
 
   mask_estimator = prepare_model(params, FLAGS.model_checkpoint, FLAGS.use_gpu)
   tensors_to_log = {
@@ -148,7 +126,7 @@ def main(unused_argv):
   )
 
   predictions = mask_estimator.predict(
-    input_fn=lambda: h5_utils.predict_input_fn_h5_v2(
+    input_fn=lambda: h5_utils.predict_input_fn_h5(
       input_volume=FLAGS.input_volume, 
       input_offset=input_offset,
       input_size=input_size,
