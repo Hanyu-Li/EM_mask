@@ -17,6 +17,9 @@ import pandas as pd
 from tqdm.auto import tqdm
 import logging
 import argparse
+from scipy.ndimage.measurements import find_objects, center_of_mass
+from em_mask.precomputed_utils import ffn_to_cv, get_chunk_bboxes, prepare_precomputed
+
 import os
 tqdm.pandas()
 
@@ -29,31 +32,31 @@ mpi_comm = MPI.COMM_WORLD
 mpi_rank = mpi_comm.Get_rank()
 mpi_size = mpi_comm.Get_size()
 
-def ffn_to_cv(ffn_bb):
-  '''Convert ffn style bbox to cloudvolume style.'''
-  offset = np.array(ffn_bb.start)
-  size = np.array(ffn_bb.size)
-  return Bbox(a=offset, b=offset+size)
+# def ffn_to_cv(ffn_bb):
+#   '''Convert ffn style bbox to cloudvolume style.'''
+#   offset = np.array(ffn_bb.start)
+#   size = np.array(ffn_bb.size)
+#   return Bbox(a=offset, b=offset+size)
 
-def get_chunk_bboxes(
-  union_bbox, 
-  chunk_size, 
-  overlap,
-  include_small_sub_boxes=True,
-  back_shift_small_sub_boxes=False):
-  '''Use ffn bbox calculator to generate overlapping cloudvolume bbox.'''
-  ffn_style_bbox = bounding_box.BoundingBox(
-    np.array(union_bbox.minpt), np.array(union_bbox.size3()))
+# def get_chunk_bboxes(
+#   union_bbox, 
+#   chunk_size, 
+#   overlap,
+#   include_small_sub_boxes=True,
+#   back_shift_small_sub_boxes=False):
+#   '''Use ffn bbox calculator to generate overlapping cloudvolume bbox.'''
+#   ffn_style_bbox = bounding_box.BoundingBox(
+#     np.array(union_bbox.minpt), np.array(union_bbox.size3()))
 
-  calc = bounding_box.OrderlyOverlappingCalculator(
-    outer_box=ffn_style_bbox, 
-    sub_box_size=chunk_size, 
-    overlap=overlap, 
-    include_small_sub_boxes=include_small_sub_boxes,
-    back_shift_small_sub_boxes=back_shift_small_sub_boxes)
+#   calc = bounding_box.OrderlyOverlappingCalculator(
+#     outer_box=ffn_style_bbox, 
+#     sub_box_size=chunk_size, 
+#     overlap=overlap, 
+#     include_small_sub_boxes=include_small_sub_boxes,
+#     back_shift_small_sub_boxes=back_shift_small_sub_boxes)
 
-  bbs = [ffn_to_cv(ffn_bb) for ffn_bb in calc.generate_sub_boxes()]
-  return bbs
+#   bbs = [ffn_to_cv(ffn_bb) for ffn_bb in calc.generate_sub_boxes()]
+#   return bbs
 
 def get_pos(seg_id, vc_id, overlap, offset):
   pos = np.stack(np.where(np.logical_and(overlap[..., 0] == seg_id, overlap[..., 1] == vc_id)), axis=1)
@@ -74,6 +77,56 @@ def get_all_poses(seg_id, vc_id, overlap, offset):
   max_pos = np.max(pos, axis=0) + offset
   return med_pos, min_pos, max_pos
 
+def find_vc_fast(seg_chunk, mask_chunk, vc_chunk, offset, vc_thresh=30, size_thresh=500):
+  '''For seg_chunk, find all pre synaptic vc sites and find matching post synaptic partner'''
+  # mask chunk 1 soma 2 vessel
+  vc_chunk[np.isin(mask_chunk, [1, 2])] = 0
+  vc_chunk = ndimage.gaussian_filter(vc_chunk, sigma=(2, 2, 1))
+  vc_chunk[seg_chunk == 0] = 0
+
+  vc_mask = vc_chunk > vc_thresh
+  vc_seeds, _ = ndimage.label(vc_chunk > vc_thresh * 2)
+  vc_labels = watershed(-vc_chunk, markers=vc_seeds, mask=vc_mask, 
+    connectivity=np.ones((3,3,3)))
+  
+  overlap = np.stack([seg_chunk, vc_labels], axis=-1)
+  valid_overlaps = overlap[np.logical_and(overlap[..., 0] != 0, overlap[..., 1] != 0), :]
+  if not valid_overlaps.shape[0]:
+    return None, vc_labels
+  uni_pairs, uni_counts = np.unique(valid_overlaps, axis=0, return_counts=True)
+  
+
+  pair_count_entry = [
+    {'seg_id': k[0],
+    'vc_id': k[1],
+    'vc_size': v} for k, v in zip(uni_pairs, uni_counts) if k[0] != 0 and k[1] != 0 and v > size_thresh]
+  
+  if not len(pair_count_entry):
+    return None, vc_labels
+
+  seg_vc_df = pd.DataFrame(pair_count_entry)
+  seg_vc_df = keep_max_generic(seg_vc_df, 'vc_id', 'vc_size')
+
+  # get position with scipy.ndimage.measure
+  valid_keys = seg_vc_df['vc_id']
+  objs = find_objects(vc_labels)
+  cofm = center_of_mass(vc_mask, vc_labels, valid_keys)
+
+  pos_entries = {}
+  for i, k in enumerate(valid_keys):
+    slc = objs[k - 1]
+    vc_min = np.array([slc[0].start, slc[1].start, slc[2].start]) + offset
+    vc_max = np.array([slc[0].stop, slc[1].stop, slc[2].stop]) + offset
+    vc_center = np.round(cofm[i] + offset)
+    pos_entries[k] = [vc_center, vc_min, vc_max]
+    # print(i, k, pos_entries[k])
+
+  seg_vc_df['vc_pos'], seg_vc_df['vc_min_pos'], seg_vc_df['vc_max_pos'] = zip(
+    *seg_vc_df.apply(lambda row: pos_entries[row.vc_id], axis=1))
+  
+  return seg_vc_df, vc_labels
+
+  
 def find_vc(seg_chunk, mask_chunk, vc_chunk, offset, vc_thresh=30, size_thresh=500):
   '''For seg_chunk, find all pre synaptic vc sites and find matching post synaptic partner'''
   # mask chunk 1 soma 2 vessel
@@ -200,12 +253,28 @@ def find_sj(seg_vc_df, seg_chunk, vc_labels, mask_chunk, sj_chunk, offset,
   return synapse_df, sj_labels
 
 
+def get_angle_old(a, b, c):
+  ba = a - b
+  bc = c - b
+  base = np.linalg.norm(ba) * np.linalg.norm(bc)
+  if base == 0:
+    return 0
+  cosine_angle = np.dot(ba, bc) / base
+  angle = np.arccos(cosine_angle)
+  return np.degrees(angle)
 def get_angle(a, b, c):
   ba = a - b
   bc = c - b
-  cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-  angle = np.arccos(cosine_angle)
-  return np.degrees(angle)
+  sign = np.sign(np.dot(ba, bc))
+  base = np.dot(ba, ba) * np.dot(bc, bc)
+  # base = np.linalg.norm(ba) * np.linalg.norm(bc)
+  if base == 0:
+    return 0
+  cos = sign * np.sqrt(np.dot(ba, bc) ** 2 / base)
+  return np.degrees(np.arccos(cos))
+  # cosine_angle = np.dot(ba, bc) / base
+  # angle = np.arccos(cosine_angle)
+  # return np.degrees(angle)
 
 
 def find_post_syn(synapse_df, seg_chunk, sj_labels, offset, 
@@ -240,6 +309,11 @@ def find_post_syn(synapse_df, seg_chunk, sj_labels, offset,
     # chose the largest one that forms obtuse angle vc - sj - post
     for ps in post_seg_entries:
       ps['angle'] = get_angle(pre_pos, row.sj_pos, ps['pos'] +local_offset) 
+      # logging.warning('pos %s', ps['pos'])
+      # if np.isnan(ps['angle']):
+        # logging.warning('failed at %s, %s, %s', pre_pos, ps['pos'])
+        # logging.warning('failed at %s, %s, %s', pre_pos, row.sj_pos, ps['pos'] + local_offset)
+        # return
     post_seg_entries = [ps for ps in post_seg_entries if ps['angle'] > max_angle]
     if not post_seg_entries: continue
     # each sj can only have one post syn seg partner
@@ -268,20 +342,22 @@ def find_post_syn(synapse_df, seg_chunk, sj_labels, offset,
   return new_synapse_df, line_annos
 
 def analyze_synapse(
-  segmentation_vol, vc_vol, sj_vol, mask_vol,
+  segmentation_vol, vc_vol, sj_vol, mask_vol, mask_mip,
   output_dir, chunk_size, overlap, offset, size):
-
+  '''
+  segmentaion, vc, sj are by default at same mip level
+  '''
   vc_thresh = 5
   sj_thresh = 5
   chunk_size = np.array(chunk_size)
   overlap = np.array(overlap)
   if mpi_rank == 0:
     os.makedirs(output_dir, exist_ok=True)
-    cv_args = dict(mip=0, progress=False, parallel=False, fill_missing=True, bounded=False)
-    seg_cv = CloudVolume('file://%s' % segmentation_vol, **cv_args)
-    vc_cv = CloudVolume('file://%s' % vc_vol, **cv_args)
-    sj_cv = CloudVolume('file://%s' % sj_vol, **cv_args)
-    mask_cv = CloudVolume('file://%s' % mask_vol, **cv_args)
+    cv_args = dict(progress=False, parallel=False, fill_missing=True, bounded=False)
+    seg_cv = CloudVolume('file://%s' % segmentation_vol, mip=0, **cv_args)
+    vc_cv = CloudVolume('file://%s' % vc_vol, mip=0, **cv_args)
+    sj_cv = CloudVolume('file://%s' % sj_vol, mip=0, **cv_args)
+    mask_cv = CloudVolume('file://%s' % mask_vol, mip=mask_mip, **cv_args)
     if offset is None or size is None:
       union_bb = Bbox.intersection(seg_cv.meta.bounds(0), vc_cv.meta.bounds(0))
       offset = union_bb.minpt
@@ -294,24 +370,33 @@ def analyze_synapse(
     print(union_bb)
     bbs = get_chunk_bboxes(union_bb, chunk_size, overlap)
     print(len(bbs))
-    sub_bbs = np.array_split(bbs, mpi_size)
+    all_inds = np.arange(len(bbs))
+    np.random.shuffle(all_inds)
+    sub_inds = np.array_split(all_inds, mpi_size)
+    # sub_bbs = np.array_split(bbs, mpi_size)
   else:
     seg_cv = None
     vc_cv = None
     sj_cv = None
     mask_cv = None
-    sub_bbs = None
+    bbs = None
+    sub_inds = None
+    # sub_bbs = None
 
   seg_cv = mpi_comm.bcast(seg_cv, 0)
   vc_cv = mpi_comm.bcast(vc_cv, 0)
   sj_cv = mpi_comm.bcast(sj_cv, 0)
   mask_cv = mpi_comm.bcast(mask_cv, 0)
-  sub_bbs = mpi_comm.scatter(sub_bbs, 0)
+  # sub_bbs = mpi_comm.scatter(sub_bbs, 0)
+  bbs = mpi_comm.bcast(bbs, 0)
+  sub_inds = mpi_comm.scatter(sub_inds, 0)
   
   padding = overlap // 2
   all_vc_dfs = []
   all_syn_dfs = []
-  for ind, bb in tqdm(enumerate(sub_bbs), total=len(sub_bbs), desc='iterate bbs'):
+  # for ind, bb in tqdm(enumerate(sub_bbs), total=len(sub_bbs), desc='iterate bbs'):
+  for ind in tqdm(sub_inds, total=len(sub_inds), desc='iterate bbs'):
+    bb = bbs[ind]
     bb = Bbox(bb.minpt + padding, bb.maxpt - padding)
     offset = bb.minpt
     seg_chunk = np.array(seg_cv[bb])[..., 0]
@@ -321,8 +406,7 @@ def analyze_synapse(
     if np.logical_or.reduce(seg_chunk.ravel()) == 0:
       continue
 
-
-    vc_df, vc_labels = find_vc(
+    vc_df, vc_labels = find_vc_fast(
       seg_chunk, mask_chunk, vc_chunk, offset, 
       vc_thresh=vc_thresh, size_thresh=100)
     if vc_df is None:
@@ -347,6 +431,7 @@ def analyze_synapse(
       all_syn_dfs.append(synapse_df)
 
   mpi_comm.barrier()
+  logging.warning('rank %d reached', mpi_rank)
   all_vc_dfs = mpi_comm.reduce(all_vc_dfs, MPI.SUM, 0)
   all_syn_dfs = mpi_comm.reduce(all_syn_dfs, MPI.SUM, 0)
   if mpi_rank == 0:
@@ -362,15 +447,16 @@ def analyze_synapse(
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("segmentation_vol", help="segmentation volume")
-  parser.add_argument("vc_vol", help="vc volume")
-  parser.add_argument("sj_vol", help="sj volume")
-  parser.add_argument("--mask_vol", help="mask volume")
-  parser.add_argument("--output_dir", default=None)
-  parser.add_argument("--chunk_size", default='512,512,128')
-  parser.add_argument("--overlap", default='32,32,16')
-  parser.add_argument("--offset", default=None)
-  parser.add_argument("--size", default=None)
+  parser.add_argument("segmentation_vol", type=str, help="segmentation volume")
+  parser.add_argument("vc_vol", type=str, help="vc volume")
+  parser.add_argument("sj_vol", type=str, help="sj volume")
+  parser.add_argument("--mask_vol", type=str, help="mask volume")
+  parser.add_argument("--mask_mip", default=0, type=int, help="mask mip")
+  parser.add_argument("--output_dir", type=str, default=None)
+  parser.add_argument("--chunk_size", type=str, default='512,512,128')
+  parser.add_argument("--overlap", type=str, default='32,32,16')
+  parser.add_argument("--offset", type=str, default=None)
+  parser.add_argument("--size", type=str, default=None)
 
   # params to control syn finding
 
@@ -387,7 +473,8 @@ def main():
   else:
     size = None
 
-  analyze_synapse(args.segmentation_vol, args.vc_vol, args.sj_vol, args.mask_vol, 
+  analyze_synapse(args.segmentation_vol, args.vc_vol, args.sj_vol, 
+    args.mask_vol, args.mask_mip,
     args.output_dir, chunk_size, overlap, offset, size)
 
 if __name__ == "__main__":

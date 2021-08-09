@@ -9,7 +9,10 @@ import tensorflow as tf
 from em_mask.io_utils import load_from_numpylike, preprocess_image
 from tqdm import tqdm
 from mpi4py import MPI
+from cloudvolume import CloudVolume
+from cloudvolume.lib import Bbox
 import os
+
 mpi_comm = MPI.COMM_WORLD
 mpi_rank = mpi_comm.Get_rank()
 mpi_size = mpi_comm.Get_size()
@@ -186,10 +189,14 @@ def writer(
   logits_cv = mpi_comm.bcast(logits_cv, 0)
   class_cv = mpi_comm.bcast(class_cv, 0)
 
+  # overlap is determined by input_shape, automatically infer label padding
   chunk_shape = np.array(chunk_shape)
+  label_shape = np.array(label_shape)
   
   # write without padding 
   padding = np.array(overlap) // 2
+  label_padding = padding - (chunk_shape - label_shape) // 2 
+  # logging.warning('--label_padding %s', label_padding)
 
   for i, p in tqdm(enumerate(prediction_generator), desc='bbox', total=num_iter): 
     assert 'logits' in p and 'class_prediction' in p
@@ -204,13 +211,94 @@ def writer(
     for i, b in tqdm(enumerate(bboxes), desc='batch', disable=True):
       logits_chunk = p['logits'][i].transpose((2,1,0,3))
       class_chunk = p['class_prediction'][i].transpose((2,1,0))
+      # in_shape = np.array(tuple(chunk_shape) + (logits_chunk.shape[-1],))
+
       in_shape = logits_chunk.shape
       in_slc = np.s_[
-        padding[0]:in_shape[0]-padding[0],
-        padding[1]:in_shape[1]-padding[1],
-        padding[2]:in_shape[2]-padding[2]
+        label_padding[0]:in_shape[0]-label_padding[0],
+        label_padding[1]:in_shape[1]-label_padding[1],
+        label_padding[2]:in_shape[2]-label_padding[2]
+        # 0:1
       ]
+      # in_shape = logits_chunk.shape
+      # in_slc = np.s_[
+      #   padding[0]:in_shape[0]-padding[0],
+      #   padding[1]:in_shape[1]-padding[1],
+      #   padding[2]:in_shape[2]-padding[2]
+      # ]
+      # logging.warning('--in_shape %s %s %s', logits_chunk.shape, in_shape, in_slc)
+
+      # clip_chunk = np.clip(logits_chunk, -0.5, 0.5)
+      # norm_logits_chunk = np.floor(
+      #   255 * (clip_chunk - np.min(clip_chunk[:])) / (np.max(clip_chunk[:]) - np.min(clip_chunk[:]))).astype(np.uint8)
+
       norm_logits_chunk = np.floor(255 * (np.clip(logits_chunk, -0.5, 0.5) + 0.5)).astype(np.uint8)
+
+      # logging.warning('--prenorm value %s %s %s', 
+      #   np.min(logits_chunk[:]),
+      #   np.max(logits_chunk[:]),
+      #   np.mean(logits_chunk[:])
+      # )
+
+      # logging.warning('--norm value %s', np.mean(norm_logits_chunk[:]))
       logits_cv[b] = norm_logits_chunk[in_slc]
       class_cv[b] = np.uint8(class_chunk[in_slc])
 
+
+# Manipulate CloudVolumes
+def ffn_to_cv(ffn_bb):
+  '''Convert ffn style bbox to cloudvolume style.'''
+  offset = np.array(ffn_bb.start)
+  size = np.array(ffn_bb.size)
+  return Bbox(a=offset, b=offset+size)
+
+def get_chunk_bboxes(
+  union_bbox, 
+  chunk_size, 
+  overlap,
+  include_small_sub_boxes=True,
+  back_shift_small_sub_boxes=False):
+  ffn_style_bbox = bounding_box.BoundingBox(
+    np.array(union_bbox.minpt), np.array(union_bbox.size3()))
+
+  calc = bounding_box.OrderlyOverlappingCalculator(
+    outer_box=ffn_style_bbox, 
+    sub_box_size=chunk_size, 
+    overlap=overlap, 
+    include_small_sub_boxes=include_small_sub_boxes,
+    back_shift_small_sub_boxes=back_shift_small_sub_boxes)
+
+  bbs = [ffn_to_cv(ffn_bb) for ffn_bb in calc.generate_sub_boxes()]
+
+  return bbs
+def prepare_precomputed(precomputed_path, offset, size, 
+  resolution, chunk_size, factor=(2,2,1), layer_type='segmentation', dtype='uint32'):
+  cv_args = dict(
+    bounded=False, fill_missing=True, autocrop=False,
+    cache=False, compress_cache=None, cdn_cache=False,
+    progress=False, provenance=None, compress=True, 
+    non_aligned_writes=True, parallel=False)
+  if layer_type == 'image':
+    encoding = 'raw'
+    compress = False
+  elif layer_type == 'segmentation':
+    encoding = 'compressed_segmentation'
+    compress = True
+  else:
+    raise ValueError
+  info = CloudVolume.create_new_info(
+    num_channels=1,
+    layer_type=layer_type,
+    data_type=dtype,
+    encoding=encoding,
+    # compress=compress,
+    resolution=list(resolution),
+    voxel_offset=np.array(offset),
+    volume_size=np.array(size),
+    chunk_size=chunk_size,
+    max_mip=0,
+    factor=factor,
+    )
+  cv = CloudVolume('file://'+precomputed_path, mip=0, info=info, **cv_args)
+  cv.commit_info()
+  return cv

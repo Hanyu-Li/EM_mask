@@ -574,6 +574,120 @@ def train_input_fn(data_volumes,
       return ds
   return h5_coord_chunk_dataset
 
+def train_input_rebalance_fn(data_volumes, 
+                   label_volumes, 
+                   tf_coords,
+                   num_classes, 
+                   chunk_shape, 
+                   label_shape, 
+                   batch_size, 
+                   offset, 
+                   scale,
+                   rotation=False,
+                   rebalance=False
+                   ):
+  '''
+  Rebalance, where to assign stronger weight to foreground
+  try to use different loss, like dice loss
+  '''
+  def get_weight_simple(label):
+    '''given label tensor, get weight tensor on the fly'''
+    #balance_ratio = tf.reduce_sum(tf.where(label > 0)) * 1.0 / np.product(label.shape)
+    #logging.warning('--balance ratio: %s', balance_ratio)
+    #tf.print('balance')
+    weights = tf.where(label > 0, 100.0, 1.0)
+    return weights
+  # def get_weight(label_tensor):
+  #   def _get_weight_func(label):
+  #     valid_ratio = (np.sum(label[:] > 0) / np.product(label_shape))
+  #     #balancer = (1 - valid_ratio) / valid_ratio
+  #     #logging.warning('--balance ratio: %s %s', valid_ratio, balancer)
+  #     weights = np.where(label > 0, 1 - valid_ratio, valid_ratio).astype(np.float32)
+  #     return weights
+
+  #   with tf.name_scope('get_weight') as scope:
+  #     weights_tensor = tf.compat.v1.py_func(
+  #         _get_weight_func, [label_tensor], [tf.float32],
+  #         name=scope)[0]
+  #     weights_tensor.set_shape(list(label_shape[::-1]) + [num_classes])
+  #     logging.warn('after weights %s', weights_tensor.shape)
+  #     return weights_tensor
+
+
+  def h5_coord_chunk_dataset():
+    image_volume_map = {}
+    for vol in data_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+
+    label_volume_map = {}
+    for vol in label_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      if num_classes > 1:
+        label_volume_map[volname] = tf.keras.utils.to_categorical(
+          h5py.File(path, 'r')[dataset])
+      else:
+        label_volume_map[volname] = np.expand_dims(h5py.File(path, 'r')[dataset], axis=-1)
+        
+
+    for key in image_volume_map: # Currently only works with one key in the map
+      if rotation:
+        pre_chunk_shape, pre_label_shape = get_full_size(chunk_shape, label_shape)
+      else:
+        pre_chunk_shape, pre_label_shape = chunk_shape, label_shape
+
+      logging.warning('pre rotation shapes: %s %s', pre_chunk_shape, pre_label_shape)
+
+      max_shape = image_volume_map[key].shape
+
+      label_scale = 1.0 # convert 0-1 to -0.5, 0.5 for regression model
+      # label_offset = 0.0 if num_classes > 1 else -0.5 # convert 0-1 to -0.5, 0.5 for regression model
+      label_offset = 0.0
+
+
+      files = tf.data.Dataset.list_files(tf_coords+'*')
+      files = files.shuffle(100)
+      ds = files.apply(
+        tf.data.experimental.parallel_interleave(
+          lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
+          cycle_length=2
+        )
+      )
+      ds = ds.shard(hvd.size(), hvd.rank())
+      ds = ds.repeat().shuffle(8000)
+      ds = ds.map(parser, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.map(lambda coord, volname: (
+          coord, 
+          load_from_numpylike(coord, image_volume_map[key], pre_chunk_shape), 
+          load_from_numpylike(coord, label_volume_map[key], pre_label_shape)), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.map(lambda coord, image, label: (
+          coord, 
+          preprocess_image(image, offset, scale),
+          tf.cast(label, tf.float32) * label_scale + label_offset), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      if rotation:
+        ds = ds.map(lambda coord, image, label: random_rotate(
+          coord, image, label, chunk_shape, label_shape), 
+          num_parallel_calls=tf.data.experimental.AUTOTUNE)         
+      ds = ds.map(lambda coord, image, label: (
+        {
+          'center': coord[0],
+          'image': image,
+          'weights': get_weight_simple(label)
+        } if rebalance else {
+          'center': coord[0],
+          'image': image,
+        },
+        label),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.batch(batch_size, drop_remainder=True)
+      ds = ds.prefetch(16)
+      logging.warn('ds_shape: %d, %s', batch_size, ds)
+
+      return ds
+  return h5_coord_chunk_dataset
+
 def train_input_fn_with_weight(
   data_volumes, 
   label_volumes, 
@@ -664,3 +778,288 @@ def train_input_fn_with_weight(
 
   return h5_coord_chunk_dataset
 
+def load_from_numpylike_mult(
+  coord_tensor, 
+  volname_tensor, 
+  volume_map, 
+  chunk_shape, 
+  volume_axes='zyx'):
+  """ Load a chunk from numpylike volume.
+
+  Args:
+    coord: Tensor of shape (3,) in xyz order
+    volume: A numpy like volume
+    chunk_shape: 3-tuple/list of shape in xyz
+    volume_axes: specify the axis order in volume
+  Returns:
+    Tensor loaded with data from coord
+  """
+  chunk_shape = np.array(chunk_shape)
+  start_offset = (chunk_shape - 1) // 2
+  def _load_from_numpylike(coord, volname):
+    volume = volume_map[volname.decode('ascii')]
+    starts = np.array(coord[0]) - start_offset
+    slc = bounding_box.BoundingBox(start=starts, size=chunk_shape).to_slice()
+    if volume_axes == 'zyx':
+      data = volume[slc[0], slc[1], slc[2], :]
+    elif volume_axes == 'xyz':
+      data = volume[slc[2], slc[1], slc[0], :]
+      data = data.transpose([2,1,0,3])
+      logging.warning('data shape %s', data.shape)
+    else:
+      raise ValueError('volume_axes mush either be "zyx" or "xyz"')
+    return data
+  volumes = iter(volume_map.values())
+  first_vol = next(volumes)
+  dtype = first_vol.dtype
+  num_classes = first_vol.shape[-1]
+  logging.warn('weird class: %d %s', num_classes, first_vol.shape)
+  with tf.name_scope('load_from_h5') as scope:
+    volname_tensor = tf.squeeze(volname_tensor, axis=0)
+    loaded = tf.compat.v1.py_func(
+        _load_from_numpylike, [coord_tensor, volname_tensor], [dtype],
+        name=scope)[0]
+    loaded.set_shape(list(chunk_shape[::-1]) + [num_classes])
+    logging.warn('after %s', loaded.shape)
+    return loaded
+
+def train_input_mult_fn(
+  data_volumes, 
+  label_volumes, 
+  tf_coords,
+  num_classes, 
+  chunk_shape, 
+  label_shape, 
+  batch_size, 
+  offset, 
+  scale,
+  rotation=False,
+  rebalance=False,
+  label_offset=0.0,
+  label_scale=1.0
+  ):
+  '''
+  Multiple sources of input can be used 
+  '''
+  def h5_coord_chunk_dataset():
+    image_volume_map = {}
+    for vol in data_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+
+    label_volume_map = {}
+    for vol in label_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      if num_classes > 1:
+        label_volume_map[volname] = tf.keras.utils.to_categorical(
+          h5py.File(path, 'r')[dataset])
+      else:
+        label_volume_map[volname] = np.expand_dims(h5py.File(path, 'r')[dataset], axis=-1)
+    # logging.warning('input maps %s %s', image_volume_map, label_volume_map)    
+    if rotation:
+      pre_chunk_shape, pre_label_shape = get_full_size(chunk_shape, label_shape)
+    else:
+      pre_chunk_shape, pre_label_shape = chunk_shape, label_shape
+    # logging.warning('pre rotation shapes: %s %s', pre_chunk_shape, pre_label_shape)
+
+    # chunk_shape and label shape must be the same across volumes
+    max_shapes = {}
+    for key in image_volume_map:
+      max_shapes[key] = image_volume_map[key].shape
+
+    # label_scale = 1.0 # convert 0-1 to -0.5, 0.5 for regression model
+    # label_offset = 0.0 if num_classes > 1 else -0.5 # convert 0-1 to -0.5, 0.5 for regression model
+    # label_offset = 0.0
+
+
+    files = tf.data.Dataset.list_files(tf_coords+'*')
+    files = files.shuffle(100)
+    ds = files.apply(
+      tf.data.experimental.parallel_interleave(
+        lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
+        cycle_length=2
+      )
+    )
+    ds = ds.shard(hvd.size(), hvd.rank())
+    ds = ds.repeat().shuffle(8000)
+    ds = ds.map(parser, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    ds = ds.map(lambda coord, volname: (
+        coord, 
+        load_from_numpylike_mult(coord, volname, image_volume_map, pre_chunk_shape), 
+        load_from_numpylike_mult(coord, volname, label_volume_map, pre_label_shape)), 
+      num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    ds = ds.map(lambda coord, image, label: (
+        coord, 
+        preprocess_image(image, offset, scale),
+        tf.cast(label, tf.float32) * label_scale + label_offset), 
+      num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    if rotation:
+      ds = ds.map(lambda coord, image, label: random_rotate(
+        coord, image, label, chunk_shape, label_shape), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)         
+    ds = ds.map(lambda coord, image, label: (
+      {
+        'center': coord[0],
+        'image': image,
+        'weights': get_weight_simple(label)
+      } if rebalance else {
+        'center': coord[0],
+        'image': image,
+      },
+      label),
+      num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.prefetch(16)
+    logging.warn('ds_shape: %d, %s', batch_size, ds)
+
+    return ds
+  return h5_coord_chunk_dataset
+
+def train_input_fn_with_weight(
+  data_volumes, 
+  label_volumes, 
+  weight_volumes,
+  tf_coords,
+  num_classes, 
+  chunk_shape, 
+  label_shape, 
+  batch_size, 
+  offset, 
+  scale,
+  rotation=False):
+  def h5_coord_chunk_dataset():
+    image_volume_map = {}
+    for vol in data_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      image_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+
+    label_volume_map = {}
+    for vol in label_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      if num_classes > 1:
+        label_volume_map[volname] = tf.keras.utils.to_categorical(
+          h5py.File(path, 'r')[dataset])
+      else:
+        label_volume_map[volname] = np.expand_dims(h5py.File(path, 'r')[dataset], axis=-1)
+        
+    weight_volume_map = {}
+    for vol in weight_volumes.split(','):
+      volname, path, dataset = vol.split(':')
+      weight_volume_map[volname] = np.expand_dims(h5py.File(path,'r')[dataset], axis=-1)
+        
+
+    for key in image_volume_map: # Currently only works with one key in the map
+      if rotation:
+        pre_chunk_shape, pre_label_shape = get_full_size(chunk_shape, label_shape)
+      else:
+        pre_chunk_shape, pre_label_shape = chunk_shape, label_shape
+
+      logging.warning('pre rotation shapes: %s %s', pre_chunk_shape, pre_label_shape)
+
+      max_shape = image_volume_map[key].shape
+
+      label_scale = 1.0 # convert 0-1 to -0.5, 0.5 for regression model
+      label_offset = 0.0 if num_classes > 1 else -0.5 # convert 0-1 to -0.5, 0.5 for regression model
+
+
+      files = tf.data.Dataset.list_files(tf_coords+'*')
+      files = files.shard(hvd.size(), hvd.rank())
+      ds = files.apply(
+        tf.data.experimental.parallel_interleave(
+          lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
+          cycle_length=2
+        )
+      )
+      ds = ds.repeat().shuffle(8000)
+      ds = ds.map(parser, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.map(lambda coord, volname: (
+          coord, 
+          load_from_numpylike(coord, image_volume_map[key], pre_chunk_shape), 
+          load_from_numpylike(coord, label_volume_map[key], pre_label_shape),
+          load_from_numpylike(coord, weight_volume_map[key], pre_chunk_shape),
+          ), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.map(lambda coord, image, label, weights: (
+          coord, 
+          preprocess_image(image, offset, scale),
+          tf.cast(label, tf.float32) * label_scale + label_offset,
+          weights
+          ), 
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      if rotation:
+        ds = ds.map(lambda coord, image, label, weights: random_rotate_with_weights(
+          coord, image, label, weights, chunk_shape, label_shape), 
+          num_parallel_calls=tf.data.experimental.AUTOTUNE)         
+      ds = ds.map(lambda coord, image, label, weights: (
+        {
+        'center': coord[0],
+        'image': image,
+        'weights': weights
+        },
+        label),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      ds = ds.batch(batch_size, drop_remainder=True)
+      ds = ds.prefetch(1)
+      logging.warn('ds_shape: %d, %s', batch_size, ds)
+      return ds
+
+  return h5_coord_chunk_dataset
+
+# Manipulate CloudVolumes
+def ffn_to_cv(ffn_bb):
+  '''Convert ffn style bbox to cloudvolume style.'''
+  offset = np.array(ffn_bb.start)
+  size = np.array(ffn_bb.size)
+  return Bbox(a=offset, b=offset+size)
+
+def get_chunk_bboxes(
+  union_bbox, 
+  chunk_size, 
+  overlap,
+  include_small_sub_boxes=True,
+  back_shift_small_sub_boxes=False):
+  ffn_style_bbox = bounding_box.BoundingBox(
+    np.array(union_bbox.minpt), np.array(union_bbox.size2()))
+
+  calc = bounding_box.OrderlyOverlappingCalculator(
+    outer_box=ffn_style_bbox, 
+    sub_box_size=chunk_size, 
+    overlap=overlap, 
+    include_small_sub_boxes=include_small_sub_boxes,
+    back_shift_small_sub_boxes=back_shift_small_sub_boxes)
+
+  bbs = [ffn_to_cv(ffn_bb) for ffn_bb in calc.generate_sub_boxes()]
+
+  return bbs
+
+def prepare_precomputed(precomputed_path, offset, size, 
+  resolution, chunk_size, factor=(1,2,1), layer_type='segmentation', dtype='uint32'):
+  cv_args = dict(
+    bounded=False, fill_missing=True, autocrop=False,
+    cache=False, compress_cache=None, cdn_cache=False,
+    progress=False, provenance=None, compress=True, 
+    non_aligned_writes=True, parallel=False)
+  if layer_type == 'image':
+    encoding = 'raw'
+    compress = False
+  elif layer_type == 'segmentation':
+    encoding = 'compressed_segmentation'
+    compress = True
+  else:
+    raise ValueError
+  info = CloudVolume.create_new_info(
+    num_channels=0,
+    layer_type=layer_type,
+    data_type=dtype,
+    encoding=encoding,
+    # compress=compress,
+    resolution=list(resolution),
+    voxel_offset=np.array(offset),
+    volume_size=np.array(size),
+    chunk_size=chunk_size,
+    max_mip=-1,
+    factor=factor,
+    )
+  cv = CloudVolume('file://'+precomputed_path, mip=-1, info=info, **cv_args)
+  cv.commit_info()
+  return cv

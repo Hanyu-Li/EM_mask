@@ -64,6 +64,7 @@ flags.DEFINE_float('image_mean', 128, '')
 flags.DEFINE_float('image_stddev', 33, '')
 flags.DEFINE_integer('max_steps', 100000, '')
 flags.DEFINE_boolean('rotation', False, '')
+flags.DEFINE_boolean('weighted', False, '')
 
 
 
@@ -80,7 +81,8 @@ def main(unused_argv):
   num_classes = int(model_args['num_classes'])
 
   if num_classes == 1:
-    model_fn = model_utils.mask_model_fn_regression  
+    # model_fn = model_utils.mask_model_fn_regression  
+    model_fn = model_utils.mask_model_fn_binary  
   else:
     model_fn = model_utils.mask_model_fn_classfication
 
@@ -89,7 +91,8 @@ def main(unused_argv):
     'model_args': model_args,
     'batch_size': FLAGS.batch_size,
     'num_classes': num_classes,
-    'learning_rate': FLAGS.learning_rate
+    'learning_rate': FLAGS.learning_rate,
+    'weighted': FLAGS.weighted
   }
 
   gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -133,7 +136,19 @@ def main(unused_argv):
       FLAGS.image_stddev,
       FLAGS.rotation)
   else:
-    input_fn = io_utils.train_input_fn(
+    # input_fn = io_utils.train_input_fn(
+    #   FLAGS.data_volumes, 
+    #   FLAGS.label_volumes, 
+    #   FLAGS.tf_coords,
+    #   num_classes,
+    #   fov_size, 
+    #   label_size,
+    #   FLAGS.batch_size, 
+    #   FLAGS.image_mean, 
+    #   FLAGS.image_stddev,
+    #   FLAGS.rotation)
+    # input_fn = io_utils.train_input_rebalance_fn(
+    input_fn = io_utils.train_input_mult_fn(
       FLAGS.data_volumes, 
       FLAGS.label_volumes, 
       FLAGS.tf_coords,
@@ -143,7 +158,8 @@ def main(unused_argv):
       FLAGS.batch_size, 
       FLAGS.image_mean, 
       FLAGS.image_stddev,
-      FLAGS.rotation)
+      FLAGS.rotation,
+      False)
 
   mask_estimator.train(
     input_fn=input_fn,
